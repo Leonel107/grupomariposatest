@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=75.0,<76"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "saas-data-platform"
+version = "0.1.0"
+description = "Multi-tenant SaaS data platform using PySpark and Delta Lake"
+readme = "README.md"
+requires-python = "==3.13.2"
+
+dependencies = [
+    "pyspark==3.5.9",
+    "delta-spark==3.3.3",
+    "omegaconf==2.3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "ruff==0.16.4",
+]
+
+[project.scripts]
+saas-pipeline = "saas_pipeline.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
