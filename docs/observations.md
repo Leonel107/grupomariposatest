@@ -1,34 +1,90 @@
-# Observaciones y mejoras — RAW → BRONZE
+# Observaciones y mejoras — RAW → BRONZE → SILVER
 
 ## 1. Objetivo
 
-Este documento registra las observaciones, decisiones técnicas y mejoras aplicadas durante la implementación de las capas **RAW** y **BRONZE** de la plataforma de datos.
+Este documento registra las observaciones, decisiones técnicas y mejoras identificadas durante la implementación de las capas **RAW, BRONZE y SILVER** de la plataforma de datos.
 
-El objetivo es mantener trazabilidad sobre las diferencias entre la arquitectura inicialmente propuesta y la implementación realizada, así como documentar las decisiones técnicas que permitan mantener la integridad, reproducibilidad y mantenibilidad del pipeline.
+El objetivo es mantener trazabilidad sobre:
 
-El alcance de este documento se limita exclusivamente a las capas **RAW** y **BRONZE** implementadas hasta el momento.
+- decisiones tomadas durante la implementación;
+- diferencias o ambigüedades encontradas respecto de la arquitectura provista;
+- criterios utilizados para resolver dichas ambigüedades;
+- mejoras tecnológicas identificadas para futuras iteraciones.
+
+La arquitectura de referencia establece una separación clara entre RAW, Bronze, Silver y Gold. RAW conserva los archivos fuente; Bronze preserva el esquema original y agrega metadatos técnicos; Silver constituye la zona limpia, normalizada y enriquecida para consumo analítico.
+
+El alcance actual de este documento comprende exclusivamente las capas **RAW, BRONZE y SILVER**. Las observaciones relacionadas con Gold se documentarán cuando dicha capa sea implementada.
 
 ---
 
-# 2. Arquitectura considerada
+# 2. Arquitectura implementada
 
-La arquitectura implementada hasta este punto mantiene la separación entre:
+La implementación actual sigue el siguiente flujo:
+
+```text
+                         ┌─────────────────────────┐
+                         │          RAW            │
+                         │                         │
+                         │ CSV original            │
+                         │ Sin transformación      │
+                         └────────────┬────────────┘
+                                      │
+                                      │ Ingesta
+                                      ▼
+                         ┌─────────────────────────┐
+                         │        BRONZE           │
+                         │                         │
+                         │ Delta                   │
+                         │ Esquema original        │
+                         │ + columnas técnicas     │
+                         │ Particionado            │
+                         └────────────┬────────────┘
+                                      │
+                                      │ Transformación
+                                      ▼
+              ┌─────────────────────────────────────────────┐
+              │                   SILVER                    │
+              │                                             │
+              │  fact_deliveries       dim_materials        │
+              │  - Datos limpios        - SCD Type 2        │
+              │  - Unidades ST          - Material          │
+              │  - Flags                - Descripción       │
+              │  - Anomalías            - Categoría         │
+              │  - Enriquecimiento      - Precio base      │
+              └──────────────────────┬──────────────────────┘
+                                     │
+                                     ▼
+                              GOLD (siguiente etapa)
+```
+
+La estructura local utilizada sigue la convención definida por la arquitectura:
 
 ```text
 data/
 ├── raw/
-│   └── archivos fuente originales
+│   └── archivos fuente
 │
-└── bronze/
-    └── sv/
-        └── deliveries/
-            ├── _delta_log/
-            └── archivos Delta
+├── bronze/
+│   └── <tenant>/
+│       └── deliveries/
+│           └── fecha_proceso=YYYYMMDD/
+│
+├── silver/
+│   └── <tenant>/
+│       ├── fact_deliveries/
+│       │   └── fecha_proceso=YYYYMMDD/
+│       │
+│       └── dim_materials/
+│
+├── silver_quarantine/
+│   └── <tenant>/
+│       └── fact_deliveries/
+│
+└── shared/
+    └── quality_logs/
 ```
 
-La capa RAW representa los archivos fuente recibidos sin transformación de negocio.
-
-La capa BRONZE representa una copia persistente de los datos procesada mediante Spark y almacenada en formato Delta Lake, incorporando únicamente información técnica necesaria para trazabilidad y operación del pipeline.
+La arquitectura especifica que Bronze debe particionarse por `fecha_proceso` y tenant, mientras que `fact_deliveries` debe particionarse por `fecha_proceso` y `dim_materials` no requiere particionamiento debido a su baja cardinalidad.
 
 ---
 
@@ -144,13 +200,11 @@ es conveniente durante el desarrollo, pero puede producir diferencias de tipo de
 
 La inferencia de tipos puede generar comportamientos diferentes si el contenido de los archivos cambia entre ejecuciones.
 
-Por ejemplo, una columna que normalmente contiene valores numéricos podría ser interpretada de manera diferente si aparecen valores atípicos.
-
 ### Mejora recomendada
 
 Definir progresivamente un esquema explícito para los archivos RAW cuando el contrato de datos del origen esté formalizado.
 
-La implementación actual puede mantener la inferencia mientras se valida y documenta el esquema esperado.
+La implementación actual mantiene la inferencia para facilitar la ejecución de la prueba técnica.
 
 ---
 
@@ -160,35 +214,76 @@ La implementación actual puede mantener la inferencia mientras se valida y docu
 
 ### Observación
 
-La capa BRONZE no debe eliminar columnas provenientes de RAW.
+Bronze debe preservar las columnas provenientes de RAW y agregar únicamente las columnas técnicas requeridas.
 
 ### Importancia
 
-BRONZE debe conservar suficiente información para permitir trazabilidad entre la fuente original y las capas posteriores.
-
-Eliminar columnas en esta etapa podría provocar pérdida de información antes de que se hayan realizado las transformaciones analíticas correspondientes.
+Bronze funciona como una copia persistente y trazable de la fuente, por lo que eliminar o modificar columnas originales dificulta la auditoría y la recuperación.
 
 ### Decisión / mejora aplicada
 
-Se implementó una validación que verifica que:
+Se implementaron validaciones automatizadas que comprueban:
 
-- todas las columnas RAW existan en BRONZE;
-- no existan columnas RAW faltantes;
-- no existan columnas adicionales que no estén justificadas técnicamente.
+- presencia de todas las columnas RAW;
+- ausencia de columnas inesperadas;
+- ausencia de columnas duplicadas;
+- tipos de datos esperados;
+- presencia de columnas técnicas.
 
-La prueba correspondiente valida la preservación del esquema original.
+La validación RAW → Bronze se ejecutó exitosamente.
 
 ---
 
-## OBS-BRZ-002 — Separación entre columnas de negocio y columnas técnicas
+## OBS-BRZ-002 — Particionado por fecha y tenant
 
 ### Observación
 
-Las columnas originales se mantienen separadas conceptualmente de las columnas agregadas por el pipeline.
+La arquitectura establece que Bronze debe particionarse mediante `fecha_proceso` y `_tenant_id`.
 
-### Columnas técnicas implementadas
+### Decisión / mejora aplicada
 
-Actualmente BRONZE incorpora:
+La escritura Bronze utiliza particionamiento por:
+
+```text
+fecha_proceso
+_tenant_id
+```
+
+Esto permite:
+
+- aislamiento lógico por tenant;
+- lectura eficiente por rango de fechas;
+- reprocesamiento controlado;
+- alineamiento con la arquitectura definida.
+
+---
+
+## OBS-BRZ-003 — Idempotencia mediante overwrite por partición
+
+### Observación
+
+La arquitectura define `replaceWhere` o mecanismo equivalente para evitar duplicados durante reprocesos.
+
+### Decisión / mejora aplicada
+
+Bronze utiliza:
+
+```text
+mode("overwrite")
+replaceWhere(...)
+```
+
+limitando el reemplazo al tenant y rango de fechas procesado.
+
+Una segunda ejecución del mismo rango no genera duplicados.
+
+---
+
+## OBS-BRZ-004 — Trazabilidad mediante columnas técnicas
+
+### Observación
+
+La arquitectura requiere:
 
 ```text
 _ingestion_timestamp
@@ -197,766 +292,573 @@ _tenant_id
 _batch_id
 ```
 
-### Importancia
+### Decisión / mejora aplicada
 
-Estas columnas permiten conocer:
+Estas columnas se incorporan durante la ingestión Bronze.
 
-- cuándo se procesó el registro;
-- de qué archivo provino;
+Esto permite identificar:
+
+- cuándo fue procesado el registro;
+- desde qué archivo provino;
 - a qué tenant pertenece;
-- a qué ejecución o lote de procesamiento corresponde.
-
-### Decisión / mejora aplicada
-
-Se incorporaron columnas técnicas sin modificar las columnas originales del dataset.
+- qué ejecución produjo el registro.
 
 ---
 
-## OBS-BRZ-003 — Trazabilidad mediante batch_id
+## OBS-BRZ-005 — Las anomalías de negocio permanecen fuera de Bronze
 
 ### Observación
 
-Cada ejecución de ingestión debe poder identificarse de manera independiente.
+Durante la revisión de la arquitectura se identificó que las reglas de anomalías corresponden a la lógica de procesamiento de Silver.
 
 ### Decisión / mejora aplicada
 
-Se incorpora:
+Bronze no descarta ni pone en cuarentena registros por:
 
-```text
-_batch_id
-```
+- cantidades inválidas;
+- precios nulos;
+- materiales inexistentes;
+- tipos de entrega fuera del alcance analítico.
 
-como identificador de ejecución.
+La responsabilidad de estas reglas se mantiene en Silver, donde pueden clasificarse, auditarse y persistirse de acuerdo con la política definida.
 
-El valor se genera para cada ejecución del pipeline y permite asociar los registros procesados con un lote específico.
-
-### Beneficio
-
-Esto permite investigar posteriormente qué registros fueron generados durante una determinada ejecución.
+Esta decisión evita convertir Bronze en una capa de transformación de negocio y mantiene su función como capa de ingesta y trazabilidad.
 
 ---
 
-## OBS-BRZ-004 — Trazabilidad mediante archivo fuente
+# 5. Observaciones sobre la capa SILVER
+
+## OBS-SLV-001 — La arquitectura no especifica completamente el orden de aplicación de las reglas de calidad
 
 ### Observación
 
-Es necesario conocer el archivo de origen de cada registro almacenado en BRONZE.
+La arquitectura define las reglas de anomalías, normalización, filtrado y enriquecimiento, pero no establece explícitamente el orden exacto en que deben ejecutarse.
 
-### Decisión / mejora aplicada
+Esto es particularmente importante para la fecha, ya que una fecha inválida no debe eliminarse antes de ser clasificada como anomalía.
 
-Se incorpora:
+### Decisión / resolución aplicada
 
-```text
-_source_file
-```
-
-para conservar el nombre del archivo RAW utilizado durante la ingestión.
-
-### Beneficio
-
-Permite rastrear un registro desde BRONZE hacia su archivo de origen.
-
----
-
-## OBS-BRZ-005 — Trazabilidad temporal de ingestión
-
-### Observación
-
-La fecha contenida en los datos de negocio no necesariamente representa el momento en que el registro fue procesado por la plataforma.
-
-### Decisión / mejora aplicada
-
-Se incorpora:
+Se estableció el siguiente orden lógico:
 
 ```text
-_ingestion_timestamp
-```
-
-para registrar el timestamp correspondiente a la ingestión.
-
-### Beneficio
-
-Permite diferenciar:
-
-```text
-fecha del dato
-      vs.
-fecha de ingestión
-```
-
-Esta distinción es importante para auditoría y diagnóstico de pipelines.
-
----
-
-# 5. Particionamiento de BRONZE
-
-## OBS-BRZ-006 — Particionamiento por fecha y tenant
-
-### Observación
-
-La información BRONZE puede crecer significativamente en volumen, por lo que almacenar todos los registros en una única partición física no es conveniente.
-
-### Decisión / mejora aplicada
-
-La tabla Delta BRONZE se encuentra particionada mediante:
-
-```text
-fecha_proceso
-_tenant_id
-```
-
-### Beneficios
-
-El particionamiento permite:
-
-- reducir el volumen de datos leído en determinadas consultas;
-- aprovechar partition pruning;
-- separar físicamente los datos por tenant;
-- facilitar operaciones sobre rangos temporales;
-- mantener una organización consistente de los datos.
-
-### Validación
-
-La estructura Delta fue validada verificando que las columnas de particionamiento sean:
-
-```text
-fecha_proceso
-_tenant_id
-```
-
----
-
-# 6. Multi-tenancy
-
-## OBS-BRZ-007 — Identificación explícita del tenant
-
-### Observación
-
-La arquitectura contempla múltiples tenants, por lo que el tenant debe formar parte de la información técnica del registro.
-
-### Decisión / mejora aplicada
-
-Se incorpora:
-
-```text
-_tenant_id
-```
-
-en BRONZE.
-
-Además, la ejecución del pipeline recibe explícitamente el tenant mediante el parámetro:
-
-```text
---tenant sv
-```
-
-### Validación
-
-Se implementaron pruebas para verificar que:
-
-1. la columna `_tenant_id` exista;
-2. los registros pertenezcan al tenant esperado;
-3. no se mezclen registros de diferentes tenants dentro de una ejecución destinada a un tenant específico.
-
----
-
-# 7. Preservación de registros
-
-## OBS-BRZ-008 — Validación de cantidad de registros RAW → BRONZE
-
-### Observación
-
-Durante la implementación se identificó la necesidad de demostrar que el proceso de ingestión no elimina registros de manera accidental.
-
-### Decisión / mejora aplicada
-
-Se incorporó una prueba de conteo entre RAW y BRONZE.
-
-La validación considera que:
-
-```text
-cantidad de registros RAW
-        =
-cantidad de registros BRONZE
-```
-
-para el mismo conjunto de datos y rango procesado.
-
-### Importancia
-
-Esta prueba permite detectar:
-
-- filtros involuntarios;
-- registros descartados;
-- errores de lectura;
-- problemas de ingestión;
-- modificaciones incorrectas de la lógica.
-
----
-
-# 8. Integridad del contenido RAW → BRONZE
-
-## OBS-BRZ-009 — Validación de contenido
-
-### Observación
-
-La validación del número de registros por sí sola no garantiza que los datos sean idénticos.
-
-Es posible mantener la misma cantidad de filas pero alterar sus valores.
-
-### Decisión / mejora aplicada
-
-Se incorporaron pruebas para validar la integridad del contenido entre RAW y BRONZE.
-
-La validación considera las columnas originales y permite comprobar que los registros originales no hayan sido modificados durante la ingestión.
-
-### Importancia
-
-Esto proporciona una validación más sólida del proceso:
-
-```text
-RAW
- │
- │ preservación de columnas
- │ preservación de tipos
- │ preservación de registros
- │ preservación de valores
- ▼
 BRONZE
+   │
+   ▼
+Normalización de fecha
+   │
+   ▼
+Clasificación de anomalías
+   │
+   ├──────────────► Cuarentena
+   │
+   ├──────────────► Descarte
+   │
+   ▼
+Registros válidos
+   │
+   ▼
+Deduplicación exacta
+   │
+   ▼
+Normalización de unidades
+   │
+   ▼
+Flags de negocio
+   │
+   ▼
+Enriquecimiento temporal
+   │
+   ▼
+fact_deliveries
 ```
+
+No se aplica el filtro de rango de fechas antes de clasificar las anomalías de fecha.
+
+### Justificación
+
+De esta manera, una fecha nula o inválida no desaparece silenciosamente y puede ser enviada a cuarentena con `_quarantine_reason`.
 
 ---
 
-# 9. Validación de tipos de datos
-
-## OBS-BRZ-010 — Preservación de tipos de columnas RAW
+## OBS-SLV-002 — La definición de anomalías se centraliza en Silver
 
 ### Observación
 
-No basta con validar que una columna exista. También debe comprobarse que su tipo de dato sea consistente.
+La arquitectura define seis categorías principales de anomalías:
+
+- `fecha_proceso` nula o inválida;
+- cantidad nula, negativa o cero;
+- material inexistente en catálogo;
+- `tipo_entrega` fuera del conjunto permitido;
+- duplicados exactos;
+- precio nulo.
+
+La arquitectura también define acciones diferentes para cada una: cuarentena, descarte o deduplicación.
 
 ### Decisión / mejora aplicada
 
-Se incorporaron pruebas para verificar los tipos de las columnas originales.
+La implementación clasifica los registros antes de generar `fact_deliveries`.
 
-Asimismo, se validaron los tipos correspondientes a las columnas técnicas.
+Las filas enviadas a cuarentena conservan la información disponible y agregan:
+
+```text
+_quarantine_reason
+```
+
+Los tipos de entrega fuera de alcance son contabilizados como descartados y no se incorporan a Silver.
+
+Los duplicados exactos se deduplican conservando una sola copia.
 
 ### Beneficio
 
-Esto permite detectar cambios accidentales como:
+La lógica permite diferenciar entre:
 
 ```text
-integer → string
-double  → string
-timestamp → string
+ERROR DE DATOS → CUARENTENA
+
+FUERA DE ALCANCE → DESCARTE
+
+DUPLICADO EXACTO → DEDUPLICACIÓN
 ```
 
-que podrían afectar procesos posteriores.
+en lugar de tratar todos los registros inválidos de la misma forma.
 
 ---
 
-# 10. Validación de columnas duplicadas
-
-## OBS-BRZ-011 — Control de columnas duplicadas
+## OBS-SLV-003 — Uso de una clave de negocio compuesta para fact_deliveries
 
 ### Observación
 
-Un DataFrame con columnas duplicadas puede generar ambigüedad durante las transformaciones posteriores.
-
-### Decisión / mejora aplicada
-
-Se incorporó una prueba que verifica que BRONZE no contenga nombres de columnas duplicados.
-
-### Resultado esperado
-
-Cada nombre de columna debe ser único dentro del esquema BRONZE.
-
----
-
-# 11. Formato Delta Lake
-
-## OBS-BRZ-012 — Persistencia de BRONZE en Delta Lake
-
-### Observación
-
-La capa BRONZE requiere un formato que permita almacenar los datos de forma estructurada y soportar operaciones propias de una plataforma de datos.
-
-### Decisión / mejora aplicada
-
-BRONZE se implementó utilizando Delta Lake.
-
-La estructura resultante contiene:
+La arquitectura define la siguiente clave de negocio para `fact_deliveries`:
 
 ```text
-data/bronze/sv/deliveries/
-├── _delta_log/
-└── archivos parquet
+(_tenant_id,
+ fecha_proceso,
+ transporte,
+ ruta,
+ material,
+ tipo_entrega)
 ```
 
-### Beneficios
-
-Delta permite disponer de:
-
-- almacenamiento columnar;
-- transacciones ACID;
-- metadatos de tabla;
-- evolución controlada del esquema;
-- historial de operaciones;
-- integración nativa con Spark.
-
----
-
-# 12. Validación de lectura Delta
-
-## OBS-BRZ-013 — BRONZE debe poder ser leído como Delta
-
-### Observación
-
-La generación de archivos Parquet no garantiza que la tabla se haya generado correctamente como Delta.
+y establece que Silver debe utilizar `MERGE INTO` para actualizar registros existentes o insertar nuevos.
 
 ### Decisión / mejora aplicada
 
-Se incorporó una prueba que lee explícitamente BRONZE mediante:
+La implementación utiliza esta clave como criterio de idempotencia para `fact_deliveries`.
 
-```python
-spark.read.format("delta").load(...)
+Esto permite que una reejecución del mismo período no genere registros duplicados.
+
+### Trade-off
+
+Una clave compuesta de seis columnas puede resultar más costosa que una clave técnica única, pero mantiene explícita la granularidad de negocio y evita introducir una identidad artificial que no está definida por la fuente.
+
+---
+
+## OBS-SLV-004 — Normalización de unidades en Silver
+
+### Observación
+
+La fuente contiene unidades diferentes, mientras que la arquitectura requiere una unidad común:
+
+```text
+1 CS = 20 ST
+```
+
+Todos los registros analíticos de Silver deben quedar expresados en ST.
+
+### Decisión / mejora aplicada
+
+La conversión se realiza mediante operaciones nativas de Spark.
+
+Conceptualmente:
+
+```text
+unidad = CS
+cantidad = X
+
+        ↓
+
+cantidad_normalizada_st = X * 20
+unidad = ST
+```
+
+Los registros originalmente expresados en ST mantienen su cantidad.
+
+### Beneficio
+
+Las capas posteriores pueden realizar agregaciones sin mezclar unidades de medida diferentes.
+
+---
+
+## OBS-SLV-005 — Flags de negocio derivados de tipo_entrega
+
+### Observación
+
+La arquitectura requiere dos indicadores:
+
+```text
+is_routine_delivery
+is_bonus_delivery
+```
+
+### Decisión / mejora aplicada
+
+Se implementaron los flags mediante expresiones Spark:
+
+```text
+ZPRE, ZVE1 → is_routine_delivery = true
+
+Z04, Z05 → is_bonus_delivery = true
+```
+
+Los tipos de entrega fuera del conjunto permitido son tratados previamente como descartados.
+
+### Beneficio
+
+La clasificación queda materializada en Silver y no necesita ser reconstruida por cada consumidor.
+
+---
+
+## OBS-SLV-006 — SCD Type 2 para dim_materials
+
+### Observación
+
+La arquitectura establece que `dim_materials` debe utilizar SCD Type 2 con:
+
+```text
+Clave:
+material
+
+Atributos versionados:
+descripcion
+categoria
+precio_base
+
+Control:
+valid_from
+valid_to
+is_current
+```
+
+y establece que una sola versión debe permanecer como `is_current = true` para cada SKU.
+
+### Decisión / mejora aplicada
+
+La dimensión se implementa manteniendo las versiones históricas del material en lugar de sobrescribir directamente los atributos.
+
+Esto permite conservar el estado histórico del catálogo.
+
+### Trade-off
+
+SCD Type 2 incrementa la cantidad de registros de la dimensión y la complejidad del procesamiento frente a un modelo overwrite, pero permite reconstruir correctamente el estado histórico del catálogo.
+
+---
+
+## OBS-SLV-007 — Enriquecimiento mediante join temporal
+
+### Observación
+
+Una ambigüedad importante de la arquitectura podría surgir al utilizar únicamente:
+
+```text
+is_current = true
+```
+
+para enriquecer las transacciones.
+
+Esto sería incorrecto para transacciones históricas.
+
+### Decisión / resolución aplicada
+
+El enriquecimiento utiliza la fecha de la transacción y el período de vigencia de la dimensión:
+
+```text
+fact_deliveries.fecha_proceso
+BETWEEN
+dim_materials.valid_from
+AND
+dim_materials.valid_to
+```
+
+La arquitectura establece explícitamente este comportamiento.
+
+### Justificación
+
+De esta manera, una transacción histórica utiliza el precio y atributos del material correspondientes a la fecha en que ocurrió la operación y no necesariamente los atributos actuales.
+
+---
+
+## OBS-SLV-008 — Separación entre precio de transacción y precio del catálogo
+
+### Observación
+
+La dimensión contiene `precio_base`, mientras que las transacciones contienen su propio `precio`.
+
+No deben tratarse como la misma información.
+
+### Decisión / mejora aplicada
+
+Silver conserva ambos conceptos:
+
+```text
+precio
+    → precio asociado a la transacción
+
+precio_base
+    → precio proveniente del catálogo para la versión
+      correspondiente al período
 ```
 
 ### Beneficio
 
-Esto valida que la salida generada sea realmente una tabla Delta funcional.
+Esto evita perder el contexto histórico del catálogo y permite diferenciar posteriormente el precio transaccional del precio de referencia.
 
 ---
 
-# 13. Validaciones automatizadas
-
-## OBS-BRZ-014 — Incorporación de pruebas automatizadas
+## OBS-SLV-009 — `_tenant_id` como identificador técnico de tenant
 
 ### Observación
 
-Las validaciones manuales mediante comandos de Spark permiten inspeccionar los resultados, pero no son suficientes como mecanismo permanente de control.
+La arquitectura utiliza códigos de tenant en minúscula y establece `_tenant_id` como columna técnica.
 
 ### Decisión / mejora aplicada
 
-Se implementó una suite de pruebas mediante `pytest`.
+La implementación mantiene:
 
-Actualmente se validan aspectos como:
+```text
+SV → sv
+HN → hn
+```
+
+y utiliza:
+
+```text
+_tenant_id
+```
+
+como identificador técnico consistente entre las capas.
+
+Esto evita depender directamente del valor original de `pais` para identificar el tenant.
+
+---
+
+## OBS-SLV-010 — Validaciones automatizadas como contrato de la capa
+
+### Observación
+
+La implementación de Silver fue acompañada por pruebas automatizadas que validan estructura, contenido y reglas de transformación.
+
+Actualmente se cuenta con **24 pruebas automatizadas exitosas**.
+
+### Controles implementados
+
+Entre las validaciones se encuentran:
 
 - estructura Delta;
 - lectura como Delta;
 - existencia de datos;
-- columnas técnicas;
-- tenant;
-- tenant esperado;
-- particionamiento;
-- preservación de columnas RAW;
-- ausencia de columnas inesperadas;
+- `_tenant_id`;
+- aislamiento de tenant;
 - ausencia de columnas duplicadas;
-- tipos de datos;
-- tipos de columnas técnicas;
-- cantidad de registros;
-- integridad del contenido.
-
-### Resultado
-
-Las pruebas implementadas para RAW → BRONZE se encuentran aprobadas.
-
----
-
-# 14. Validación formal del contrato RAW → BRONZE
-
-## OBS-BRZ-015 — Establecimiento de un contrato técnico entre capas
-
-### Observación
-
-Durante la implementación se identificó que la relación entre RAW y BRONZE debía validarse explícitamente y no depender únicamente de una inspección visual.
-
-### Decisión / mejora aplicada
-
-Se estableció un conjunto de invariantes para el proceso RAW → BRONZE:
-
-```text
-1. No perder columnas originales
-2. No agregar columnas no justificadas
-3. No duplicar columnas
-4. Mantener los tipos esperados
-5. No perder registros
-6. No alterar valores originales
-7. Agregar únicamente columnas técnicas
-8. Mantener el tenant correcto
-9. Mantener el particionamiento definido
-10. Generar una tabla Delta válida
-```
-
-Estas condiciones constituyen actualmente el contrato técnico de la ingestión RAW → BRONZE.
-
----
-
-# 15. Observaciones de operación en entorno Windows
-
-## OBS-OPS-001 — Mensajes de Spark relacionados con archivos temporales
-
-### Observación
-
-Durante las ejecuciones locales se observaron mensajes como:
-
-```text
-Exception while deleting Spark temp dir
-Failed to delete
-org.antlr_antlr4-runtime-4.9.3.jar
-```
-
-También se observaron mensajes relacionados con `ShutdownHookManager`.
-
-### Evaluación
-
-Estos mensajes aparecen durante la limpieza de archivos temporales generados por Spark y no impidieron completar correctamente las ejecuciones.
-
-La evidencia principal es que el pipeline finalizó correctamente y generó la salida BRONZE esperada.
-
-### Consideración
-
-El comportamiento está relacionado con el entorno local Windows y el manejo de archivos temporales/JAR utilizados por Spark.
-
-### Mejora recomendada
-
-Mantener monitoreado este comportamiento durante el desarrollo local. En caso de que posteriormente provoque fallos reales de ejecución, deberá evaluarse una configuración específica del entorno Windows o la ejecución del pipeline en un entorno Linux.
-
----
-
-# 16. Observaciones sobre logging
-
-## OBS-OPS-002 — Nivel de logging de Spark
-
-### Observación
-
-Durante las ejecuciones se muestran mensajes como:
-
-```text
-Setting default log level to "WARN".
-```
-
-### Evaluación
-
-Este comportamiento corresponde a la configuración por defecto de Spark y no representa un error del pipeline.
-
-### Mejora recomendada
-
-Establecer posteriormente una configuración centralizada de logging para controlar:
-
-- nivel de log;
-- mensajes funcionales;
-- errores;
-- advertencias;
-- identificación de ejecución;
-- trazabilidad del pipeline.
-
-La mejora debe realizarse sin modificar la lógica funcional de RAW → BRONZE.
-
----
-
-# 17. Observaciones sobre representación de planes Spark
-
-## OBS-OPS-003 — Truncamiento de planes de ejecución
-
-### Observación
-
-Durante algunas operaciones se observó:
-
-```text
-WARN SparkStringUtils:
-Truncated the string representation of a plan since it was too large.
-```
-
-### Evaluación
-
-Este mensaje corresponde a la representación textual del plan de ejecución de Spark y no indica pérdida ni corrupción de datos.
-
-### Mejora recomendada
-
-No modificar esta configuración únicamente para eliminar el warning.
-
-En caso de requerir análisis detallado del plan de ejecución, puede ajustarse específicamente:
-
-```text
-spark.sql.debug.maxToStringFields
-```
-
-durante tareas de diagnóstico.
-
----
-
-# 18. Observaciones sobre configuración de Spark + Delta
-
-## OBS-OPS-004 — Configuración consistente de Spark y Delta
-
-### Observación
-
-Las operaciones Delta requieren que la `SparkSession` tenga correctamente configuradas las extensiones y el catálogo Delta.
-
-Durante las validaciones manuales se comprobó que crear una sesión Spark sin dicha configuración produce errores como:
-
-```text
-DELTA_CONFIGURE_SPARK_SESSION_WITH_EXTENSION_AND_CATALOG
-```
-
-### Decisión / mejora aplicada
-
-La creación de la sesión Spark utilizada por el pipeline y las pruebas se centraliza mediante la configuración correspondiente de Delta.
-
-Para las inspecciones manuales debe utilizarse igualmente la configuración de Spark compatible con Delta.
+- columnas requeridas;
+- tipos de entrega válidos;
+- unidades normalizadas a ST;
+- flags de entrega;
+- consistencia de flags;
+- cantidades válidas;
+- precios válidos;
+- fechas válidas;
+- consistencia tenant/país;
+- enriquecimiento de descripción;
+- enriquecimiento de categoría;
+- enriquecimiento de precio base;
+- existencia de materiales enriquecidos;
+- `_batch_id`;
+- `_ingestion_timestamp`;
+- completitud de la clave de negocio;
+- ausencia de claves de negocio duplicadas.
 
 ### Beneficio
 
-Se evita que diferentes componentes del proyecto creen sesiones Spark incompatibles entre sí.
+La batería de pruebas funciona como una barrera de regresión antes de avanzar con cambios posteriores.
 
 ---
 
-# 19. Observaciones sobre configuración del entorno de desarrollo
+# 6. Mejoras tecnológicas — Horizonte 2
 
-## OBS-ENV-001 — Entorno virtual reproducible
+## OBS-SLV-H2-001 — Separar reglas de negocio de la implementación Python
 
 ### Observación
 
-El proyecto utiliza un entorno virtual Python denominado:
+Actualmente las reglas de negocio están expresadas mediante lógica Spark dentro del pipeline.
+
+### Mejora propuesta
+
+Externalizar progresivamente reglas como:
 
 ```text
-venv
+tipos_entrega_validos
+factor_CS_ST
+columnas_clave
+reglas_de_anomalias
 ```
 
-### Decisión
+hacia configuración controlada.
 
-Se mantiene esta estructura, ya que el nombre del entorno virtual no afecta el funcionamiento de Python, PySpark ni Delta mientras las dependencias estén correctamente instaladas.
+### Beneficio
 
-### Mejora aplicada
+Permitiría modificar reglas sin alterar directamente el código de procesamiento.
 
-La configuración necesaria para ejecutar el proyecto se mantiene asociada a la configuración del proyecto y sus dependencias, evitando depender de configuraciones manuales realizadas únicamente durante una sesión de terminal.
+### Trade-off
+
+Una mayor parametrización introduce complejidad de configuración y requiere validaciones adicionales sobre los archivos YAML.
 
 ---
 
-# 20. Observaciones sobre versiones
-
-## OBS-ENV-002 — Control de versiones de dependencias
+## OBS-SLV-H2-002 — Implementar un framework formal de Data Quality
 
 ### Observación
 
-PySpark, Delta Lake, Python y Java mantienen una relación de compatibilidad que debe controlarse.
+Las pruebas automatizadas actuales validan el resultado del pipeline, pero un entorno productivo requiere además persistir los resultados de los controles de calidad como métricas operativas.
 
-### Mejora recomendada
+La arquitectura define una tabla compartida `quality_logs` con información como `_run_id`, `_batch_id`, `tenant_id`, `layer`, `check_name`, severidad, registros evaluados y registros fallidos.
 
-Mantener documentadas las versiones utilizadas en el proyecto, incluyendo como mínimo:
+### Mejora propuesta
+
+Implementar un componente reutilizable de Data Quality que permita declarar checks como:
 
 ```text
-Python
-PySpark
-Delta Lake
-Java
-pytest
+check_name
+check_severity
+condition
+records_checked
+records_failed
 ```
 
-Esto permitirá reproducir el entorno y reducir problemas derivados de actualizaciones no controladas.
+y persistir automáticamente el resultado.
+
+### Beneficio
+
+Permitiría centralizar observabilidad de calidad entre tenants y capas.
 
 ---
 
-# 21. Mejoras actualmente implementadas
+## OBS-SLV-H2-003 — Incorporar métricas de procesamiento y anomalías
 
-A la fecha, las siguientes mejoras han sido implementadas en RAW → BRONZE:
+### Observación
 
-| Mejora | Estado |
+Además del resultado final, es útil conocer cuánto volumen fue:
+
+```text
+procesado
+aceptado
+enviado a cuarentena
+descartado
+deduplicado
+```
+
+### Mejora propuesta
+
+Persistir métricas por ejecución y tenant.
+
+Ejemplo:
+
+```text
+tenant_id
+batch_id
+source_records
+valid_records
+quarantine_records
+discarded_records
+deduplicated_records
+processed_at
+```
+
+### Beneficio
+
+Facilita monitoreo operacional y detección de cambios anómalos en el volumen de datos.
+
+---
+
+# 7. Mejoras tecnológicas — Horizonte 3
+
+## OBS-PLT-H3-001 — Migración del almacenamiento local hacia ADLS Gen2 + Unity Catalog
+
+### Observación
+
+La prueba técnica utiliza paths locales para reproducir la arquitectura, mientras que el diseño objetivo está basado en Databricks, ADLS Gen2 y Unity Catalog.
+
+La arquitectura define schemas separados por tenant dentro de un catálogo por ambiente.
+
+### Mejora propuesta
+
+Migrar:
+
+```text
+data/bronze/
+data/silver/
+data/shared/
+```
+
+hacia almacenamiento cloud administrado.
+
+La estructura lógica de nombres se mantendría:
+
+```text
+saas_<env>.silver_<tenant>.fact_deliveries
+saas_<env>.silver_<tenant>.dim_materials
+```
+
+### Beneficio
+
+Se obtendrían:
+
+- gobierno centralizado;
+- control de acceso;
+- auditoría;
+- escalabilidad;
+- integración con workloads analíticos.
+
+---
+
+## OBS-PLT-H3-002 — Incorporar procesamiento incremental y observabilidad productiva
+
+### Mejora propuesta
+
+En un entorno productivo, el procesamiento podría evolucionar desde ejecución batch local hacia mecanismos incrementales y orquestados.
+
+La arquitectura contempla como evolución posible el uso de tecnologías como Auto Loader/streaming. Esta mejora debe evaluarse según volumen, frecuencia de llegada y SLA.
+
+### Beneficio
+
+Reduciría procesamiento innecesario y permitiría responder más rápidamente ante nuevas entregas de datos.
+
+### Trade-off
+
+Incrementaría significativamente la complejidad operacional frente al procesamiento batch actual.
+
+---
+
+# 8. Resumen de decisiones
+
+| Área | Decisión |
 |---|---|
-| Procesamiento utilizando Spark | Implementado |
-| Eliminación de dependencia de pandas para procesamiento distribuido | Implementado |
-| Persistencia BRONZE en Delta Lake | Implementado |
-| Particionamiento por `fecha_proceso` | Implementado |
-| Particionamiento por `_tenant_id` | Implementado |
-| Identificación del tenant | Implementado |
-| `_batch_id` | Implementado |
-| `_source_file` | Implementado |
-| `_ingestion_timestamp` | Implementado |
-| Preservación de columnas RAW | Implementado |
-| Preservación de tipos de datos | Implementado |
-| Validación de cantidad de registros | Implementado |
-| Validación de integridad del contenido | Implementado |
-| Validación de columnas duplicadas | Implementado |
-| Validación de columnas técnicas | Implementado |
-| Validación automatizada mediante pytest | Implementado |
-| Validación de lectura como Delta | Implementado |
-
----
-
-# 22. Mejoras recomendadas para RAW → BRONZE
-
-Las siguientes mejoras se consideran oportunidades técnicas para fortalecer las capas actualmente implementadas, pero **no forman parte de la implementación funcional actual**:
-
-### MEJ-001 — Schema explícito para RAW
-
-Reemplazar progresivamente `inferSchema` por esquemas definidos explícitamente cuando el contrato de datos del origen se encuentre formalizado.
-
-### MEJ-002 — Validación de archivos de entrada
-
-Agregar validaciones previas para comprobar existencia, tamaño, formato y estructura mínima de los archivos RAW.
-
-### MEJ-003 — Validación de esquema de entrada
-
-Detectar automáticamente cambios en nombres, cantidad o tipos de columnas del archivo fuente.
-
-### MEJ-004 — Control de archivos duplicados
-
-Evaluar un mecanismo para detectar si un mismo archivo RAW está siendo procesado nuevamente de forma accidental.
-
-### MEJ-005 — Idempotencia
-
-Evaluar que una misma ejecución de ingestión pueda repetirse sin generar registros duplicados en BRONZE.
-
-### MEJ-006 — Control de calidad de datos en ingestión
-
-Incorporar métricas de calidad relacionadas con:
-
-- registros nulos;
-- columnas obligatorias;
-- valores inválidos;
-- formatos incorrectos;
-- registros rechazados.
-
-Estas validaciones deben realizarse sin alterar la función de BRONZE como capa de preservación.
-
-### MEJ-007 — Logging estructurado
-
-Centralizar logs del pipeline incluyendo:
-
-```text
-tenant
-batch_id
-archivo
-inicio
-fin
-cantidad de registros
-estado
-error
-```
-
-### MEJ-008 — Métricas de ejecución
-
-Registrar métricas de cada ejecución, como:
-
-```text
-RAW records
-BRONZE records
-duración
-archivos procesados
-batch_id
-tenant
-```
-
-### MEJ-009 — Gestión controlada de errores
-
-Mejorar los mensajes de error para distinguir entre:
-
-- archivo inexistente;
-- archivo inválido;
-- esquema incompatible;
-- error de Spark;
-- error de Delta;
-- error de escritura;
-- error de configuración.
-
-### MEJ-010 — Configuración externa
-
-Evitar que parámetros funcionales como rutas, nombres de archivos o configuraciones de ingestión queden directamente codificados dentro de la lógica.
-
-Cuando corresponda, estos parámetros deberían provenir de configuración.
-
-### MEJ-011 — Limpieza controlada de temporales
-
-Evaluar la configuración del entorno local para reducir los mensajes asociados a la eliminación de archivos temporales de Spark observados en Windows.
-
-### MEJ-012 — Pruebas de regresión
-
-Mantener la suite de pruebas RAW → BRONZE como requisito previo para modificar la lógica de ingestión.
-
-Toda modificación de la implementación debe demostrar que las invariantes establecidas continúan cumpliéndose.
-
----
-
-# 23. Principios establecidos para RAW → BRONZE
-
-La implementación actual establece los siguientes principios:
-
-```text
-RAW
- │
- │ Datos originales
- │ Sin transformación de negocio
- │
- ▼
-BRONZE
- │
- ├── Conserva columnas originales
- ├── Conserva tipos esperados
- ├── Conserva registros
- ├── Conserva valores
- ├── Agrega metadatos técnicos
- ├── Identifica tenant
- ├── Identifica batch
- ├── Identifica archivo fuente
- ├── Registra timestamp de ingestión
- ├── Particiona por fecha y tenant
- └── Persiste en Delta Lake
-```
-
-La capa BRONZE se mantiene, por tanto, como una capa de **ingestión y persistencia trazable**, evitando introducir transformaciones de negocio que correspondan a etapas posteriores del pipeline.
-
----
-
-# 24. Estado actual
-
-El flujo implementado y validado actualmente es:
-
-```text
-Archivo CSV
-    │
-    ▼
-   RAW
-    │
-    │ Spark
-    │ Validaciones
-    │ Metadatos técnicos
-    │
-    ▼
-  BRONZE
-    │
-    ├── Delta Lake
-    ├── Partition: fecha_proceso
-    ├── Partition: _tenant_id
-    ├── _ingestion_timestamp
-    ├── _source_file
-    ├── _tenant_id
-    └── _batch_id
-```
-
-La implementación RAW → BRONZE cuenta actualmente con pruebas automatizadas para validar estructura, esquema, tipos, columnas, registros, tenant, particionamiento e integridad del contenido.
-
-Las pruebas implementadas se encuentran aprobadas.
-
----
-
-# 25. Criterio de cierre de RAW → BRONZE
-
-Se considera que la implementación de RAW → BRONZE cumple con el objetivo definido cuando:
-
-- RAW conserva los archivos fuente.
-- BRONZE se genera en formato Delta.
-- Las columnas originales se conservan.
-- Los tipos esperados se conservan.
-- No existen columnas duplicadas.
-- No se pierden registros.
-- No se alteran los valores originales.
-- Las columnas técnicas están presentes.
-- El tenant se encuentra correctamente identificado.
-- El batch de ejecución es trazable.
-- El archivo fuente es trazable.
-- La ingestión posee timestamp.
-- La tabla está particionada según la arquitectura definida.
-- Las pruebas automatizadas de RAW → BRONZE son exitosas.
-
-Con estos criterios cumplidos, la implementación de las capas RAW y BRONZE queda formalmente validada para efectos del alcance actual del proyecto.
+| RAW | Mantener archivos originales sin transformación |
+| Bronze | Preservar columnas RAW |
+| Bronze | Agregar únicamente metadatos técnicos |
+| Bronze | Particionar por fecha y tenant |
+| Bronze | `overwrite + replaceWhere` para idempotencia |
+| Silver | Clasificar anomalías antes de aplicar filtros que puedan ocultarlas |
+| Silver | Cuarentena para errores de datos |
+| Silver | Descarte para tipos de entrega fuera de alcance |
+| Silver | Deduplicación exacta |
+| Silver | Normalización CS → ST |
+| Silver | Flags derivados de `tipo_entrega` |
+| Silver | `fact_deliveries` con clave de negocio compuesta |
+| Silver | `dim_materials` como SCD Type 2 |
+| Silver | Join temporal para enriquecimiento |
+| Silver | `_tenant_id` como identificador técnico |
+| Silver | 24 pruebas automatizadas exitosas |
+| Futuro | Data Quality operacional |
+| Futuro | ADLS Gen2 + Unity Catalog |
+| Futuro | Procesamiento incremental |
