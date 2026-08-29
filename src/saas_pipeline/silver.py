@@ -1,12 +1,10 @@
-from datetime import datetime, timezone
 from pathlib import Path
-from uuid import uuid4
 
 from delta import configure_spark_with_delta_pip
+from delta.tables import DeltaTable
 from omegaconf import DictConfig
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
-from delta.tables import DeltaTable
 
 
 SOURCE_FILE = "global_mobility_data_entrega_productos.csv"
@@ -24,7 +22,6 @@ VALID_DELIVERY_TYPES = ["ZPRE", "ZVE1", "Z04", "Z05"]
 
 def create_spark_session() -> SparkSession:
     """Create a local Spark session configured with Delta Lake."""
-
     builder = (
         SparkSession.builder
         .appName("saas-silver")
@@ -52,7 +49,6 @@ def build_silver_path(
     table_name: str,
 ) -> Path:
     """Build the Silver table path for a tenant."""
-
     return (
         Path(silver_root)
         / tenant.lower()
@@ -67,12 +63,11 @@ def build_quarantine_path(
     table_name: str,
 ) -> Path:
     """
-    Build the quarantine table path.
+    Build quarantine path.
 
     Architecture:
         <quarantine_root>/<layer>_quarantine/<tenant>/<table>
     """
-
     return (
         Path(quarantine_root)
         / f"{layer}_quarantine"
@@ -90,8 +85,7 @@ def read_bronze(
     bronze_root: str,
     tenant: str,
 ) -> DataFrame:
-    """Read the Bronze deliveries Delta table for a tenant."""
-
+    """Read Bronze deliveries Delta table."""
     bronze_path = (
         Path(bronze_root)
         / tenant.lower()
@@ -119,7 +113,6 @@ def read_materials_catalog(
     raw_root: str,
 ) -> DataFrame:
     """Read the materials catalog."""
-
     catalog_path = (
         Path(raw_root)
         / MATERIALS_CATALOG_FILE
@@ -142,14 +135,15 @@ def read_materials_catalog(
 # DATE NORMALIZATION
 # ---------------------------------------------------------------------------
 
-def normalize_dates(df: DataFrame) -> DataFrame:
+def normalize_dates(
+    df: DataFrame,
+) -> DataFrame:
     """
-    Convert fecha_proceso to a proper date.
+    Convert fecha_proceso from YYYYMMDD to a proper date.
 
-    Invalid or null values become NULL and are later
-    classified as quarantine records.
+    Invalid or null values become NULL and are handled
+    by anomaly classification.
     """
-
     return df.withColumn(
         "_fecha_proceso_date",
         F.to_date(
@@ -183,15 +177,6 @@ def classify_anomalies(
         .withColumn("_catalog_match", F.lit(True))
     )
 
-    # ---------------------------------------------------------
-    # Catalog existence validation
-    # ---------------------------------------------------------
-    #
-    # IMPORTANT:
-    # Select only the original delivery columns plus
-    # _catalog_match. This prevents the catalog join from
-    # creating a second column named "material".
-    #
     enriched = (
         df.alias("d")
         .join(
@@ -200,14 +185,10 @@ def classify_anomalies(
             "left",
         )
         .select(
-            "d.*",
+            F.col("d.*"),
             F.col("c._catalog_match"),
         )
     )
-
-    # ---------------------------------------------------------
-    # Quarantine conditions
-    # ---------------------------------------------------------
 
     quarantine_condition = (
         F.col("_fecha_proceso_date").isNull()
@@ -220,10 +201,6 @@ def classify_anomalies(
         |
         F.col("_catalog_match").isNull()
     )
-
-    # ---------------------------------------------------------
-    # Quarantine
-    # ---------------------------------------------------------
 
     quarantine_df = (
         enriched
@@ -254,25 +231,18 @@ def classify_anomalies(
         .drop("_catalog_match")
     )
 
-    # ---------------------------------------------------------
-    # Discarded records
-    # ---------------------------------------------------------
-
     discarded_df = (
         enriched
         .filter(
             F.col("tipo_entrega").isNull()
-            | ~F.col("tipo_entrega").isin(
+            |
+            ~F.col("tipo_entrega").isin(
                 VALID_DELIVERY_TYPES
             )
         )
         .filter(~quarantine_condition)
         .drop("_catalog_match")
     )
-
-    # ---------------------------------------------------------
-    # Valid records
-    # ---------------------------------------------------------
 
     valid_df = (
         enriched
@@ -291,19 +261,15 @@ def classify_anomalies(
         discarded_df,
     )
 
+
 # ---------------------------------------------------------------------------
-# DEDUPLICATION
+# EXACT DEDUPLICATION
 # ---------------------------------------------------------------------------
 
 def deduplicate_exact_records(
     df: DataFrame,
 ) -> DataFrame:
-    """
-    Remove exact duplicate records.
-
-    All columns are considered for the deduplication.
-    """
-
+    """Remove exact duplicate records."""
     return df.dropDuplicates()
 
 
@@ -315,25 +281,45 @@ def normalize_units(
     df: DataFrame,
 ) -> DataFrame:
     """
-    Normalize quantities to ST.
+    Normalize all quantities to ST.
 
     Business rule:
         1 CS = 20 ST
-    """
 
-    return (
-        df.withColumn(
-            "cantidad",
-            F.when(
-                F.upper(F.col("unidad")) == "CS",
-                F.col("cantidad") * F.lit(20),
-            )
-            .otherwise(F.col("cantidad")),
+    Original quantity and unit are preserved.
+    """
+    return df.withColumn(
+        "cantidad_normalizada_st",
+        F.when(
+            F.upper(F.trim(F.col("unidad"))) == "CS",
+            F.col("cantidad") * F.lit(20),
         )
-        .withColumn(
-            "unidad",
-            F.lit("ST"),
+        .when(
+            F.upper(F.trim(F.col("unidad"))) == "ST",
+            F.col("cantidad"),
         )
+        .otherwise(
+            F.lit(None).cast("double")
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# TRANSACTION PRICE
+# ---------------------------------------------------------------------------
+
+def add_transaction_price(
+    df: DataFrame,
+) -> DataFrame:
+    """
+    Preserve the transactional price with an explicit
+    Silver semantic name.
+
+    Gold must use this field instead of precio_base.
+    """
+    return df.withColumn(
+        "precio_transaccion",
+        F.col("precio"),
     )
 
 
@@ -345,7 +331,6 @@ def add_delivery_flags(
     df: DataFrame,
 ) -> DataFrame:
     """Add routine and bonus delivery flags."""
-
     return (
         df.withColumn(
             "is_routine_delivery",
@@ -371,16 +356,6 @@ def prepare_materials_catalog(
 ) -> DataFrame:
     """
     Prepare materials catalog for SCD Type 2.
-
-    Expected source columns:
-
-        material
-        descripcion
-        categoria
-        precio_base
-        valid_from
-        valid_to
-        is_current
     """
 
     required_columns = {
@@ -438,30 +413,22 @@ def write_dim_materials(
     output_path: Path,
 ) -> None:
     """
-    Create or replace the local Silver dim_materials Delta table.
+    Persist dim_materials as Delta.
 
-    The catalog already contains SCD Type 2 version information.
+    The source catalog already contains the SCD Type 2
+    validity information.
     """
-
-    if output_path.exists():
-        (
-            df.write
-            .format("delta")
-            .mode("overwrite")
-            .option("overwriteSchema", "true")
-            .save(str(output_path))
-        )
-    else:
-        (
-            df.write
-            .format("delta")
-            .mode("overwrite")
-            .save(str(output_path))
-        )
+    (
+        df.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .save(str(output_path))
+    )
 
 
 # ---------------------------------------------------------------------------
-# TEMPORAL ENRICHMENT
+# TEMPORAL MATERIAL ENRICHMENT
 # ---------------------------------------------------------------------------
 
 def enrich_with_materials(
@@ -469,20 +436,36 @@ def enrich_with_materials(
     materials_df: DataFrame,
 ) -> DataFrame:
     """
-    Enrich deliveries using temporal SCD Type 2 join.
+    Enrich deliveries using a temporal SCD Type 2 join.
 
-    The historical version of the material is selected based
-    on fecha_proceso.
+    Historical material version is selected according to
+    fecha_proceso.
 
-    Rule:
-        fecha_proceso >= valid_from
-        AND fecha_proceso <= valid_to
+    Join condition:
+        delivery.material = material.material
+        delivery.fecha_proceso >= valid_from
+        delivery.fecha_proceso <= valid_to
     """
 
+    deliveries = deliveries_df.alias("d")
+
+    materials = (
+        materials_df
+        .select(
+            "material",
+            "descripcion",
+            "categoria",
+            "precio_base",
+            "valid_from",
+            "valid_to",
+        )
+        .alias("m")
+    )
+
     return (
-        deliveries_df.alias("d")
+        deliveries
         .join(
-            materials_df.alias("m"),
+            materials,
             (
                 (F.col("d.material") == F.col("m.material"))
                 &
@@ -500,9 +483,9 @@ def enrich_with_materials(
         )
         .select(
             F.col("d.*"),
-            F.col("m.descripcion"),
-            F.col("m.categoria"),
-            F.col("m.precio_base"),
+            F.col("m.descripcion").alias("descripcion"),
+            F.col("m.categoria").alias("categoria"),
+            F.col("m.precio_base").alias("precio_base"),
         )
     )
 
@@ -519,7 +502,7 @@ def write_fact_deliveries(
     """
     MERGE Silver fact_deliveries using the business key:
 
-        tenant_id
+        _tenant_id
         fecha_proceso
         transporte
         ruta
@@ -537,14 +520,12 @@ def write_fact_deliveries(
     """
 
     if not output_path.exists():
-
         (
             df.write
             .format("delta")
             .mode("overwrite")
             .save(str(output_path))
         )
-
         return
 
     delta_table = DeltaTable.forPath(
@@ -572,12 +553,7 @@ def write_quarantine(
     df: DataFrame,
     output_path: Path,
 ) -> None:
-    """
-    Persist Silver quarantine records.
-
-    Quarantine records are intentionally kept outside
-    fact_deliveries.
-    """
+    """Persist Silver quarantine records."""
 
     if df.limit(1).count() == 0:
         return
@@ -609,7 +585,7 @@ def process_tenant(
     bronze_root = config.paths.bronze
 
     # ---------------------------------------------------------
-    # Read Bronze
+    # READ BRONZE
     # ---------------------------------------------------------
 
     df = read_bronze(
@@ -619,7 +595,7 @@ def process_tenant(
     )
 
     # ---------------------------------------------------------
-    # Read catalog
+    # READ MATERIALS CATALOG
     # ---------------------------------------------------------
 
     materials_catalog = read_materials_catalog(
@@ -632,7 +608,7 @@ def process_tenant(
     )
 
     # ---------------------------------------------------------
-    # SCD Type 2 dimension
+    # SCD TYPE 2 DIMENSION
     # ---------------------------------------------------------
 
     dim_materials_path = build_silver_path(
@@ -647,20 +623,17 @@ def process_tenant(
     )
 
     # ---------------------------------------------------------
-    # Normalize date
+    # DATE NORMALIZATION
     # ---------------------------------------------------------
 
     df = normalize_dates(df)
 
-    # ---------------------------------------------------------
     # IMPORTANT:
-    # No date-range filter is applied here.
-    #
-    # Invalid dates must reach quarantine.
-    # ---------------------------------------------------------
+    # Do NOT filter by start_date/end_date before anomaly
+    # classification because invalid dates must reach quarantine.
 
     # ---------------------------------------------------------
-    # Classify anomalies
+    # ANOMALY CLASSIFICATION
     # ---------------------------------------------------------
 
     (
@@ -673,7 +646,7 @@ def process_tenant(
     )
 
     # ---------------------------------------------------------
-    # Exact deduplication
+    # EXACT DEDUPLICATION
     # ---------------------------------------------------------
 
     valid_df = deduplicate_exact_records(
@@ -681,7 +654,7 @@ def process_tenant(
     )
 
     # ---------------------------------------------------------
-    # Normalize units
+    # UNIT NORMALIZATION
     # ---------------------------------------------------------
 
     valid_df = normalize_units(
@@ -689,7 +662,15 @@ def process_tenant(
     )
 
     # ---------------------------------------------------------
-    # Delivery flags
+    # TRANSACTION PRICE
+    # ---------------------------------------------------------
+
+    valid_df = add_transaction_price(
+        valid_df
+    )
+
+    # ---------------------------------------------------------
+    # DELIVERY FLAGS
     # ---------------------------------------------------------
 
     valid_df = add_delivery_flags(
@@ -697,7 +678,7 @@ def process_tenant(
     )
 
     # ---------------------------------------------------------
-    # Temporal material enrichment
+    # TEMPORAL MATERIAL ENRICHMENT
     # ---------------------------------------------------------
 
     valid_df = enrich_with_materials(
@@ -706,7 +687,28 @@ def process_tenant(
     )
 
     # ---------------------------------------------------------
-    # Write quarantine
+    # DATE RANGE
+    # ---------------------------------------------------------
+
+    start_date = F.to_date(
+        F.lit(config.execution.start_date),
+        "yyyy-MM-dd",
+    )
+
+    end_date = F.to_date(
+        F.lit(config.execution.end_date),
+        "yyyy-MM-dd",
+    )
+
+    valid_df = valid_df.filter(
+        F.col("_fecha_proceso_date").between(
+            start_date,
+            end_date,
+        )
+    )
+
+    # ---------------------------------------------------------
+    # WRITE QUARANTINE
     # ---------------------------------------------------------
 
     quarantine_path = build_quarantine_path(
@@ -722,7 +724,7 @@ def process_tenant(
     )
 
     # ---------------------------------------------------------
-    # Write fact_deliveries
+    # WRITE FACT DELIVERIES
     # ---------------------------------------------------------
 
     fact_path = build_silver_path(
@@ -738,7 +740,7 @@ def process_tenant(
     )
 
     # ---------------------------------------------------------
-    # Metrics
+    # METRICS
     # ---------------------------------------------------------
 
     valid_count = valid_df.count()
@@ -772,7 +774,6 @@ def run_silver(
         if tenant == "all":
 
             bronze_root = config.paths.bronze
-
             bronze_root_path = Path(bronze_root)
 
             if not bronze_root_path.exists():
@@ -789,7 +790,6 @@ def run_silver(
             failures = []
 
             for current_tenant in tenants:
-
                 try:
                     process_tenant(
                         spark=spark,
@@ -798,7 +798,6 @@ def run_silver(
                     )
 
                 except Exception as exc:
-
                     failures.append(
                         (
                             current_tenant,
@@ -821,7 +820,6 @@ def run_silver(
                     )
 
         else:
-
             process_tenant(
                 spark=spark,
                 config=config,

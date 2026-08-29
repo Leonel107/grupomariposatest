@@ -2,133 +2,112 @@
 
 Pipeline de datos **multi-tenant** basado en arquitectura **Medallion**, implementado con **Python, PySpark y Delta Lake**.
 
-La implementación actual cubre las capas:
+La solución implementa el flujo completo:
 
 ```text
-RAW → BRONZE → SILVER
+RAW → BRONZE → SILVER → GOLD
 ```
 
-RAW conserva los archivos fuente sin transformación. Bronze realiza la ingesta en Delta Lake preservando las columnas originales y agregando metadata técnica. Silver transforma los datos para consumo analítico mediante limpieza, normalización, manejo de anomalías, enriquecimiento con materiales y modelado SCD Type 2.
+El objetivo es disponer de una plataforma reproducible para la ingesta, transformación, validación y agregación de datos de entregas para múltiples tenants, manteniendo aislamiento lógico, trazabilidad, calidad e idempotencia.
 
 ---
 
-# 1. Objetivo
+## 1. Arquitectura
 
-El objetivo del proyecto es implementar una plataforma de datos multi-tenant que permita procesar información de entregas de productos manteniendo:
-
-- aislamiento lógico por tenant;
-- trazabilidad;
-- reproducibilidad;
-- idempotencia;
-- validaciones automatizadas;
-- calidad de datos;
-- separación clara entre ingesta y transformación de negocio.
-
-La arquitectura de referencia utiliza el patrón Medallion:
+La plataforma sigue una arquitectura Medallion con separación lógica por tenant.
 
 ```text
-RAW
- │
- ▼
-BRONZE
- │
- ▼
-SILVER
- │
- ▼
-GOLD
+                         ┌──────────────────────┐
+                         │      FUENTE CSV      │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                         ┌──────────────────────┐
+                         │         RAW          │
+                         │                      │
+                         │ Archivo original     │
+                         │ Sin transformación   │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                         ┌──────────────────────┐
+                         │       BRONZE         │
+                         │                      │
+                         │ Delta Lake           │
+                         │ Esquema original     │
+                         │ + columnas técnicas  │
+                         │ Particionado         │
+                         │ Idempotencia         │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                         ┌──────────────────────┐
+                         │        SILVER        │
+                         │                      │
+                         │ fact_deliveries      │
+                         │ Normalización         │
+                         │ Anomalías             │
+                         │ SCD Type 2             │
+                         │ Enriquecimiento       │
+                         │ Calidad               │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                         ┌──────────────────────┐
+                         │         GOLD         │
+                         │                      │
+                         │ daily_metrics_       │
+                         │ by_delivery_type     │
+                         │                      │
+                         │ Métricas de negocio  │
+                         └──────────────────────┘
 ```
 
-La implementación actual llega hasta Silver.
+La arquitectura provista establece que cada capa lea únicamente de la capa inmediatamente anterior y que Silver sea la zona de verdad para el consumo analítico downstream.
 
 ---
 
-# 2. Estado actual
+## 2. Objetivos de la implementación
 
-| Componente | Estado |
-|---|---|
-| Python | Implementado |
-| PySpark | Implementado |
-| Delta Lake | Implementado |
-| OmegaConf | Implementado |
-| Configuración YAML | Implementada |
-| CLI | Implementada |
-| RAW | Implementado |
-| Bronze | Implementado |
-| Idempotencia Bronze | Implementada |
-| Validaciones RAW → Bronze | Implementadas |
-| Silver | Implementado |
-| `fact_deliveries` | Implementado |
-| `dim_materials` | Implementado |
-| SCD Type 2 | Implementado |
-| Manejo de anomalías | Implementado |
-| Normalización CS → ST | Implementada |
-| Flags de negocio | Implementados |
-| Enriquecimiento temporal | Implementado |
-| Tests Silver | 24 pruebas exitosas |
-| Gold | Pendiente |
+La solución cubre los siguientes objetivos:
+
+- Ingesta de archivos CSV.
+- Preservación de los datos originales.
+- Almacenamiento en Delta Lake.
+- Trazabilidad mediante columnas técnicas.
+- Aislamiento lógico por tenant.
+- Procesamiento parametrizable por tenant.
+- Procesamiento parametrizable por rango de fechas.
+- Idempotencia.
+- Normalización de unidades.
+- Validación y clasificación de anomalías.
+- Cuarentena de registros inválidos.
+- Deduplicación de registros exactos.
+- Dimensión `dim_materials` con SCD Type 2.
+- Enriquecimiento temporal de entregas con información del catálogo.
+- Cálculo de métricas Gold.
+- Pruebas automatizadas para las capas implementadas.
+- Configuración mediante YAML y OmegaConf.
 
 ---
 
-# 3. Arquitectura
+# 3. Stack tecnológico
 
-```text
-                         ┌───────────────────────┐
-                         │         RAW           │
-                         │                       │
-                         │ CSV original          │
-                         │ Sin transformaciones  │
-                         └───────────┬───────────┘
-                                     │
-                                     ▼
-                         ┌───────────────────────┐
-                         │       BRONZE          │
-                         │                       │
-                         │ Delta Lake            │
-                         │ Esquema RAW           │
-                         │ + metadata técnica    │
-                         │ Particionado          │
-                         └───────────┬───────────┘
-                                     │
-                                     ▼
-              ┌──────────────────────────────────────────┐
-              │                  SILVER                   │
-              │                                          │
-              │  fact_deliveries      dim_materials      │
-              │                                          │
-              │  Limpieza              SCD Type 2         │
-              │  Normalización         Histórico          │
-              │  Flags                 Material           │
-              │  Anomalías             Descripción        │
-              │  Enriquecimiento       Categoría          │
-              │                        Precio base        │
-              └───────────────────────┬──────────────────┘
-                                      │
-                                      ▼
-                                  GOLD
-                             (siguiente etapa)
-```
-
-La arquitectura provista define Bronze como una capa de datos ingeridos y Silver como la zona limpia, normalizada y enriquecida para consumo analítico.
-
----
-
-# 4. Stack tecnológico
-
-| Componente | Versión / tecnología | Uso |
+| Componente | Tecnología / versión | Uso |
 |---|---|---|
 | Python | 3.13.2 | Lenguaje de implementación |
 | PySpark | 3.5.x | Procesamiento distribuido |
 | Delta Lake | 3.3.3 | Almacenamiento transaccional |
 | pytest | 9.1.1 | Pruebas automatizadas |
-| OmegaConf | Configuración | Gestión jerárquica |
-| Git | Git Bash | Control de versiones |
+| OmegaConf | Configuración | Configuración jerárquica |
+| Ruff / linter configurado | Python | Calidad de código |
+| Git / GitHub | Control de versiones | Versionamiento y CI/CD |
 
-Las versiones utilizadas deben mantenerse sincronizadas con la configuración del proyecto para garantizar reproducibilidad.
+Las versiones principales utilizadas se mantienen alineadas con el entorno empleado durante la implementación para favorecer la reproducibilidad.
 
 ---
 
-# 5. Estructura del repositorio
+# 4. Estructura del repositorio
 
 ```text
 saas-data-platform/
@@ -140,11 +119,6 @@ saas-data-platform/
 ├── .github/
 │   └── workflows/
 │       └── ci.yml
-│
-├── docs/
-│   ├── infra.md
-│   ├── observations.md
-│   └── onboarding-tenant.md
 │
 ├── config/
 │   ├── base.yaml
@@ -159,8 +133,7 @@ saas-data-platform/
 │
 ├── data/
 │   ├── raw/
-│   │   ├── global_mobility_data_entrega_productos.csv
-│   │   └── materials_catalog.csv
+│   │   └── *.csv
 │   │
 │   ├── bronze/
 │   │   └── <tenant>/
@@ -172,8 +145,6 @@ saas-data-platform/
 │   ├── silver/
 │   │   └── <tenant>/
 │   │       ├── fact_deliveries/
-│   │       │   └── fecha_proceso=YYYYMMDD/
-│   │       │
 │   │       └── dim_materials/
 │   │
 │   ├── silver_quarantine/
@@ -181,9 +152,16 @@ saas-data-platform/
 │   │       └── fact_deliveries/
 │   │
 │   ├── gold/
+│   │   └── <tenant>/
+│   │       └── daily_metrics_by_delivery_type/
 │   │
 │   └── shared/
 │       └── quality_logs/
+│
+├── docs/
+│   ├── infra.md
+│   ├── observations.md
+│   └── onboarding-tenant.md
 │
 ├── src/
 │   └── saas_pipeline/
@@ -199,7 +177,8 @@ saas-data-platform/
 │   ├── conftest.py
 │   ├── test_spark_environment.py
 │   ├── test_bronze.py
-│   └── test_silver.py
+│   ├── test_silver.py
+│   └── test_gold.py
 │
 └── mentoring/
     ├── bad_code.py
@@ -207,48 +186,66 @@ saas-data-platform/
     └── code_review.md
 ```
 
-La estructura mantiene la separación entre código, configuración, datos, pruebas y documentación.
+El diseño sigue la estructura propuesta por la prueba técnica, donde los datos generados no deben formar parte del versionamiento del repositorio.
 
 ---
 
-# 6. Capa RAW
+# 5. Capas de datos
 
-RAW contiene los archivos originales recibidos desde las fuentes.
+## 5.1 RAW
+
+RAW contiene los archivos recibidos desde la fuente sin transformación de negocio.
 
 Ejemplo:
 
 ```text
 data/raw/
-├── global_mobility_data_entrega_productos.csv
-└── materials_catalog.csv
+└── global_mobility_data_entrega_productos.csv
 ```
 
-RAW no aplica transformaciones de negocio.
+Características:
 
-Sus principales características son:
+- Mantiene el archivo original.
+- No normaliza unidades.
+- No elimina registros.
+- No aplica reglas de negocio.
+- No realiza agregaciones.
+- No realiza enriquecimientos.
 
-- fuente original;
-- solo lectura durante el procesamiento;
-- conservación de valores originales;
-- punto de recuperación y auditoría.
+El objetivo es conservar una representación fiel de la fuente antes de iniciar el procesamiento.
 
 ---
 
-# 7. Capa Bronze
+# 6. Capa Bronze
 
-Bronze ingesta los datos RAW utilizando PySpark y los almacena como Delta Lake.
+Bronze ingesta los datos RAW mediante PySpark y los almacena en Delta Lake.
 
-La implementación:
+Ejemplo:
 
-- preserva las columnas originales;
-- agrega columnas técnicas;
-- normaliza `_tenant_id`;
-- particiona por `fecha_proceso` y `_tenant_id`;
-- soporta procesamiento por tenant;
-- soporta rango de fechas;
-- utiliza `replaceWhere` para reprocesamiento idempotente.
+```text
+data/bronze/
+└── sv/
+    └── deliveries/
+        ├── fecha_proceso=20250101/
+        ├── fecha_proceso=20250102/
+        └── ...
+```
 
-## Columnas técnicas
+Bronze conserva las columnas originales:
+
+```text
+pais
+fecha_proceso
+transporte
+ruta
+tipo_entrega
+material
+precio
+cantidad
+unidad
+```
+
+y agrega las columnas técnicas:
 
 ```text
 _ingestion_timestamp
@@ -257,95 +254,106 @@ _tenant_id
 _batch_id
 ```
 
-## Ejecución
+Estas columnas permiten identificar cuándo se ingirió el registro, desde qué archivo provino, a qué tenant pertenece y qué ejecución generó el registro.
 
-```bash
-python -m saas_pipeline.cli \
-  --layer bronze \
-  --tenant sv \
-  --start-date 2025-01-01 \
-  --end-date 2025-06-30
+### Particionado
+
+Bronze se organiza por:
+
+```text
+fecha_proceso
+_tenant_id
 ```
+
+La estrategia de particionado permite procesar y reprocesar conjuntos de datos específicos de fecha y tenant.
+
+### Idempotencia
+
+Bronze utiliza overwrite de las particiones correspondientes al rango procesado.
+
+Una segunda ejecución del mismo rango no debe generar registros duplicados.
+
+Conceptualmente:
+
+```text
+Primera ejecución
+
+Bronze
+├── fecha=20250401
+├── fecha=20250402
+└── fecha=20250403
+
+
+Segunda ejecución
+
+Bronze
+├── fecha=20250401 ← sobrescrita
+├── fecha=20250402 ← sobrescrita
+└── fecha=20250403 ← sobrescrita
+```
+
+Esta estrategia sigue la estrategia de idempotencia definida en la arquitectura.
 
 ---
 
-# 8. Capa Silver
+# 7. Capa Silver
 
-Silver recibe información desde Bronze y aplica las reglas de transformación definidas por la arquitectura.
+Silver constituye la zona de verdad para los datos analíticos.
 
-La capa está compuesta principalmente por:
+Las principales tablas son:
 
 ```text
 fact_deliveries
 dim_materials
 ```
 
-## 8.1 `fact_deliveries`
+## 7.1 `fact_deliveries`
 
-Contiene las transacciones válidas después del procesamiento de Silver.
-
-Se aplican:
-
-- validación de fecha;
-- validación de cantidades;
-- validación de precio;
-- validación de materiales;
-- filtrado de tipos de entrega;
-- deduplicación exacta;
-- normalización de unidades;
-- flags de negocio;
-- enriquecimiento temporal;
-- control de tenant.
-
-La clave de negocio utilizada es:
+Ruta:
 
 ```text
-(_tenant_id,
- fecha_proceso,
- transporte,
- ruta,
- material,
- tipo_entrega)
+data/silver/<tenant>/fact_deliveries/
 ```
 
-La arquitectura establece `MERGE INTO` como estrategia de idempotencia para esta tabla.
+La tabla se construye a partir de Bronze y aplica las reglas de transformación definidas para la prueba.
 
----
+### Normalización de unidades
 
-# 9. Normalización de unidades
-
-Silver utiliza una unidad común:
-
-```text
-ST
-```
-
-La conversión definida es:
+Los registros cuya unidad es `CS` se convierten a `ST` utilizando:
 
 ```text
 1 CS = 20 ST
 ```
 
-Por lo tanto:
+La cantidad normalizada queda disponible en:
 
 ```text
-cantidad_normalizada_st =
-    cantidad * 20
+cantidad_normalizada_st
 ```
 
-cuando:
+Todos los registros válidos quedan expresados en una unidad común.
+
+### Precio transaccional
+
+El precio original de la transacción se conserva explícitamente como:
 
 ```text
-unidad = CS
+precio_transaccion
 ```
 
-Los registros que ya se encuentran en ST mantienen su cantidad.
+Este campo representa el precio utilizado posteriormente por Gold para calcular revenue.
 
----
+El precio del catálogo:
 
-# 10. Tipos de entrega
+```text
+precio_base
+```
 
-Los únicos tipos de entrega válidos para Silver son:
+se mantiene como información de referencia y no sustituye al precio de la transacción.
+
+### Tipos de entrega
+
+Solo se consideran válidos:
 
 ```text
 ZPRE
@@ -354,61 +362,50 @@ Z04
 Z05
 ```
 
-Los registros fuera de este conjunto se consideran fuera del alcance analítico y son contabilizados como descartados.
+Los flags generados son:
 
-Los flags derivados son:
+```text
+is_routine_delivery
+is_bonus_delivery
+```
 
-| Tipo | `is_routine_delivery` | `is_bonus_delivery` |
-|---|---:|---:|
-| ZPRE | true | false |
-| ZVE1 | true | false |
-| Z04 | false | true |
-| Z05 | false | true |
+donde:
 
----
+```text
+ZPRE, ZVE1 → is_routine_delivery = true
 
-# 11. Manejo de anomalías
+Z04, Z05 → is_bonus_delivery = true
+```
 
-Las reglas implementadas son:
+### Manejo de anomalías
+
+Las anomalías se clasifican antes de aplicar el rango de fechas para permitir que registros con fechas inválidas lleguen correctamente a cuarentena.
+
+Entre las reglas implementadas se encuentran:
 
 | Anomalía | Acción |
 |---|---|
-| `fecha_proceso` nula o inválida | Cuarentena |
-| cantidad nula, negativa o cero | Cuarentena |
-| material inexistente en catálogo | Cuarentena |
-| `tipo_entrega` fuera de las 4 válidas | Descarte |
-| duplicado exacto | Deduplicación |
-| precio nulo | Cuarentena |
+| Fecha nula/inválida | Cuarentena |
+| Cantidad nula | Cuarentena |
+| Cantidad negativa/cero | Cuarentena |
+| Material inexistente | Cuarentena |
+| Precio nulo | Cuarentena |
+| Tipo de entrega no válido | Descarte |
+| Registro exactamente duplicado | Deduplicación |
 
-Las filas enviadas a cuarentena contienen:
+La arquitectura establece explícitamente que las filas en cuarentena deben conservar una razón mediante `_quarantine_reason`, mientras que los descartes deben contabilizarse.
 
-```text
-_quarantine_reason
-```
+### SCD Type 2
 
-La arquitectura define explícitamente que las filas en cuarentena deben persistirse en una estructura paralela `<layer>_quarantine_<tenant>.<table>`.
+`dim_materials` se implementa como una dimensión SCD Type 2.
 
-Ejemplo:
-
-```text
-data/silver_quarantine/sv/fact_deliveries/
-```
-
-Un punto importante de la implementación es que las fechas inválidas se clasifican antes de aplicar un filtro de rango. Esto evita perder anomalías antes de enviarlas a cuarentena.
-
----
-
-# 12. `dim_materials` — SCD Type 2
-
-El catálogo de materiales se implementa como una dimensión histórica SCD Type 2.
-
-## Clave
+La clave de negocio es:
 
 ```text
 material
 ```
 
-## Atributos versionados
+Los atributos versionados son:
 
 ```text
 descripcion
@@ -416,7 +413,7 @@ categoria
 precio_base
 ```
 
-## Columnas de control
+y se utilizan las columnas:
 
 ```text
 valid_from
@@ -424,387 +421,527 @@ valid_to
 is_current
 ```
 
-La arquitectura establece que las transacciones deben utilizar la versión del material vigente en la fecha de la transacción y no simplemente la versión actual.
+La implementación permite mantener diferentes versiones del mismo material a través del tiempo.
 
-El enriquecimiento utiliza un join temporal:
+### Enriquecimiento temporal
 
-```text
-fact_deliveries.fecha_proceso
-BETWEEN
-dim_materials.valid_from
-AND
-dim_materials.valid_to
-```
+`fact_deliveries` se enriquece utilizando la dimensión de materiales considerando la vigencia temporal del registro.
+
+No se utiliza únicamente `is_current`, ya que una entrega histórica debe asociarse con la versión del catálogo vigente en la fecha correspondiente.
+
+La arquitectura exige explícitamente un join temporal con la dimensión SCD Type 2.
 
 ---
 
-# 13. Idempotencia
+# 8. Capa Gold
 
-La estrategia utilizada por capa es:
+La implementación construye:
 
 ```text
-BRONZE
-    │
-    └── overwrite por partición
-
-SILVER fact_deliveries
-    │
-    └── MERGE por clave de negocio
-
-SILVER dim_materials
-    │
-    └── SCD Type 2
+daily_metrics_by_delivery_type
 ```
 
-Esto permite reprocesar información sin generar duplicados.
+Ruta:
 
-La arquitectura define explícitamente `MERGE INTO` para `fact_deliveries` y para la dimensión SCD Type 2.
+```text
+data/gold/<tenant>/daily_metrics_by_delivery_type/
+```
+
+La granularidad es:
+
+```text
+(_tenant_id, fecha_proceso, tipo_entrega)
+```
+
+Es decir, existe como máximo una fila por combinación de:
+
+```text
+tenant + fecha + tipo_entrega
+```
+
+## 8.1 Métricas
+
+### `total_units`
+
+Suma de:
+
+```text
+cantidad_normalizada_st
+```
+
+No se utiliza la cantidad original de Bronze.
+
+```text
+total_units =
+SUM(cantidad_normalizada_st)
+```
+
+### `total_revenue`
+
+Se calcula utilizando el precio de la transacción:
+
+```text
+total_revenue =
+SUM(
+    cantidad_normalizada_st
+    * precio_transaccion
+)
+```
+
+No se utiliza `precio_base`.
+
+Esta distinción es importante porque `precio_base` representa información del catálogo, mientras que `precio_transaccion` representa el precio utilizado en la operación.
+
+### `active_routes`
+
+Número de rutas distintas:
+
+```text
+COUNT(DISTINCT ruta)
+```
+
+### `active_transports`
+
+Número de transportes distintos:
+
+```text
+COUNT(DISTINCT transporte)
+```
+
+Las cuatro métricas corresponden al contrato definido para Gold.
 
 ---
 
-# 14. Configuración
+# 9. Idempotencia Gold
 
-La configuración utiliza OmegaConf y mantiene separación entre:
+Gold es una capa derivada y no autoritativa.
+
+Por ello, se utiliza una estrategia de recomputación del rango procesado.
 
 ```text
-config/base.yaml
-config/env/<environment>.yaml
-config/tenants/<tenant>.yaml
+Silver
+   │
+   ▼
+Filtrar rango
+   │
+   ▼
+Agrupar
+   │
+   ▼
+Recalcular métricas
+   │
+   ▼
+Gold
 ```
 
-La configuración contempla:
+Una segunda ejecución del mismo tenant y rango debe producir el mismo resultado lógico sin duplicar agregados.
 
-```yaml
-paths:
-  raw:
-  bronze:
-  silver:
-  gold:
-  quarantine_root:
-  quality_logs:
-
-execution:
-  start_date:
-  end_date:
-  tenant:
-  fail_fast:
-
-quality:
-  fail_on_critical:
-```
-
-El rango de fechas es un parámetro de ejecución y se puede sobrescribir mediante CLI.
-
-Ejemplo:
-
-```bash
---start-date 2025-01-01
---end-date 2025-06-30
-```
+Esta estrategia corresponde con la arquitectura provista, que define Gold como una capa derivada cuyo contenido puede recomputarse.
 
 ---
 
-# 15. Reproducibilidad
+# 10. Multi-tenant
 
-## 15.1 Crear entorno virtual
+El pipeline permite ejecutar:
 
-Desde Git Bash:
+### Tenant específico
 
-```bash
-python -m venv venv
+```powershell
+python -m saas_pipeline.cli --layer bronze --tenant sv --start-date 2025-01-01 --end-date 2025-06-30
 ```
 
-Activar:
-
-```bash
-source venv/Scripts/activate
+```powershell
+python -m saas_pipeline.cli --layer silver --tenant sv --start-date 2025-01-01 --end-date 2025-06-30
 ```
 
-Verificar:
+```powershell
+python -m saas_pipeline.cli --layer gold --tenant sv --start-date 2025-01-01 --end-date 2025-06-30
+```
 
-```bash
+### Todos los tenants
+
+```powershell
+python -m saas_pipeline.cli --layer bronze --tenant all --start-date 2025-01-01 --end-date 2025-06-30
+```
+
+```powershell
+python -m saas_pipeline.cli --layer silver --tenant all --start-date 2025-01-01 --end-date 2025-06-30
+```
+
+```powershell
+python -m saas_pipeline.cli --layer gold --tenant all --start-date 2025-01-01 --end-date 2025-06-30
+```
+
+El aislamiento lógico se mantiene mediante:
+
+```text
+data/
+├── bronze/<tenant>/
+├── silver/<tenant>/
+└── gold/<tenant>/
+```
+
+La arquitectura productiva prevista utiliza schemas independientes por tenant dentro de Unity Catalog; para esta prueba, dichos schemas se representan mediante paths locales.
+
+---
+
+# 11. Configuración
+
+La configuración se encuentra separada del código mediante YAML y OmegaConf.
+
+```text
+config/
+├── base.yaml
+├── env/
+│   ├── dev.yaml
+│   ├── qa.yaml
+│   └── main.yaml
+└── tenants/
+    └── sv.yaml
+```
+
+Los parámetros principales incluyen:
+
+- paths de datos;
+- ambiente;
+- tenant;
+- fechas de procesamiento;
+- parámetros de calidad;
+- configuración de ejecución.
+
+Esto permite modificar parámetros de ejecución sin modificar la lógica del pipeline.
+
+---
+
+# 12. Requisitos previos
+
+Se requiere:
+
+- Python 3.13.2.
+- Java compatible con la versión de Spark utilizada.
+- Git.
+- PowerShell, CMD o terminal equivalente.
+
+Verificar Python:
+
+```powershell
 python --version
 ```
 
-Debe mostrar:
+Verificar Java:
 
-```text
-Python 3.13.2
+```powershell
+java -version
 ```
 
 ---
 
-## 15.2 Instalar dependencias
+# 13. Instalación
 
-```bash
+## 13.1 Clonar repositorio
+
+```powershell
+git clone https://github.com/Leonel107/grupomariposatest.git
+cd grupomariposatest
+```
+
+## 13.2 Crear entorno virtual
+
+```powershell
+python -m venv venv
+```
+
+## 13.3 Activar entorno
+
+PowerShell:
+
+```powershell
+.\venv\Scripts\Activate.ps1
+```
+
+CMD:
+
+```cmd
+venv\Scripts\activate
+```
+
+## 13.4 Instalar dependencias
+
+```powershell
+python -m pip install --upgrade pip
 pip install -e .
 ```
 
 ---
 
-## 15.3 Validar entorno Spark
+# 14. Verificar Spark + Delta
 
-```bash
+Ejecutar:
+
+```powershell
 pytest tests/test_spark_environment.py -v
+```
+
+La prueba debe finalizar correctamente.
+
+---
+
+# 15. Ejecución completa del pipeline
+
+El pipeline debe ejecutarse respetando el orden de las capas:
+
+```text
+RAW
+ │
+ ▼
+Bronze
+ │
+ ▼
+Silver
+ │
+ ▼
+Gold
+```
+
+Para el tenant `sv`:
+
+### Bronze
+
+```powershell
+python -m saas_pipeline.cli --layer bronze --tenant sv --start-date 2025-01-01 --end-date 2025-06-30
+```
+
+### Silver
+
+```powershell
+python -m saas_pipeline.cli --layer silver --tenant sv --start-date 2025-01-01 --end-date 2025-06-30
+```
+
+### Gold
+
+```powershell
+python -m saas_pipeline.cli --layer gold --tenant sv --start-date 2025-01-01 --end-date 2025-06-30
 ```
 
 ---
 
-# 16. Ejecutar el pipeline
+# 16. Pruebas automatizadas
+
+Las pruebas se encuentran en:
+
+```text
+tests/
+├── conftest.py
+├── test_spark_environment.py
+├── test_bronze.py
+├── test_silver.py
+└── test_gold.py
+```
+
+## Todos los tests
+
+```powershell
+pytest -v
+```
 
 ## Bronze
 
-```bash
-python -m saas_pipeline.cli \
-  --layer bronze \
-  --tenant sv \
-  --start-date 2025-01-01 \
-  --end-date 2025-06-30
+```powershell
+pytest tests/test_bronze.py -v
 ```
 
 ## Silver
 
-```bash
-python -m saas_pipeline.cli \
-  --layer silver \
-  --tenant sv \
-  --start-date 2025-01-01 \
-  --end-date 2025-06-30
-```
-
-La ejecución de Silver debe realizarse sobre un Bronze previamente generado.
-
----
-
-# 17. Tests
-
-## Todos los tests
-
-```bash
-pytest -v
-```
-
-## Tests Bronze
-
-```bash
-pytest tests/test_bronze.py -v
-```
-
-## Tests Silver
-
-```bash
+```powershell
 pytest tests/test_silver.py -v
 ```
 
-La implementación actual de Silver cuenta con:
+## Gold
 
-```text
-24 pruebas automatizadas exitosas
+```powershell
+pytest tests/test_gold.py -v
 ```
 
-Las pruebas cubren estructura, contenido, tenant, tipos de entrega, unidades, flags, anomalías, fechas, enriquecimiento, metadata y unicidad de la clave de negocio.
+## Entorno Spark + Delta
+
+```powershell
+pytest tests/test_spark_environment.py -v
+```
+
+Las pruebas de Silver cubren, entre otros aspectos:
+
+- estructura Delta;
+- lectura Delta;
+- presencia de datos;
+- aislamiento de tenant;
+- ausencia de columnas duplicadas;
+- columnas requeridas;
+- tipos de entrega;
+- normalización de unidades;
+- flags de negocio;
+- cantidades y precios válidos;
+- fechas;
+- consistencia tenant/país;
+- enriquecimiento de materiales;
+- batch ID;
+- timestamp de ingesta;
+- claves de negocio;
+- duplicados.
+
+Las pruebas de Gold validan:
+
+- estructura Delta;
+- lectura de la tabla;
+- existencia de datos;
+- `_tenant_id`;
+- granularidad;
+- columnas requeridas;
+- `total_units`;
+- `total_revenue`;
+- uso de precio transaccional;
+- rutas activas;
+- transportes activos;
+- consistencia de los cálculos;
+- aislamiento entre tenants;
+- comportamiento ante múltiples ejecuciones.
 
 ---
 
-# 18. Linter
+# 17. Linter
 
-Si el proyecto tiene configurado Ruff:
+El proyecto debe validarse localmente con el linter configurado en `pyproject.toml`.
 
-```bash
+Por ejemplo, si se utiliza Ruff:
+
+```powershell
 ruff check .
 ```
 
-Para aplicar correcciones automáticas cuando sea apropiado:
+Para aplicar correcciones automáticas cuando corresponda:
 
-```bash
+```powershell
 ruff check . --fix
 ```
 
-El linter debe ejecutarse desde la raíz del repositorio.
+El objetivo es detectar problemas de:
+
+- estilo;
+- imports;
+- código no utilizado;
+- errores potenciales;
+- convenciones Python.
+
+---
+
+# 18. CI/CD
+
+El repositorio contempla GitHub Actions:
+
+```text
+.github/
+└── workflows/
+    └── ci.yml
+```
+
+El workflow debe ejecutarse en:
+
+```text
+push
+pull_request
+```
+
+y validar como mínimo:
+
+```text
+Linter
+   │
+   ▼
+Tests
+   │
+   ▼
+Resultado CI
+```
+
+Esto permite evitar que cambios que rompan el pipeline o sus pruebas lleguen a la rama principal.
 
 ---
 
 # 19. Onboarding de un nuevo tenant
 
-El onboarding mantiene la separación definida por la arquitectura.
+El diseño permite incorporar un nuevo tenant sin modificar la lógica principal del pipeline.
 
-Por ejemplo, para incorporar:
+Supongamos el tenant:
 
 ```text
-tenant = hn
+hn
 ```
 
 ## Paso 1 — Crear configuración
 
-Crear:
+Agregar:
 
 ```text
 config/tenants/hn.yaml
 ```
 
-siguiendo la estructura del tenant existente.
+siguiendo la estructura de `sv.yaml`.
 
----
+## Paso 2 — Incorporar fuente RAW
 
-## Paso 2 — Incorporar la fuente RAW
-
-Agregar los archivos requeridos en:
+Agregar los archivos correspondientes a:
 
 ```text
 data/raw/
 ```
 
-La fuente debe cumplir con las columnas esperadas por el pipeline.
-
----
-
 ## Paso 3 — Ejecutar Bronze
 
-```bash
-python -m saas_pipeline.cli \
-  --layer bronze \
-  --tenant hn \
-  --start-date 2025-01-01 \
-  --end-date 2025-06-30
+```powershell
+python -m saas_pipeline.cli --layer bronze --tenant hn --start-date 2025-01-01 --end-date 2025-06-30
 ```
 
-Se generará:
+## Paso 4 — Ejecutar Silver
+
+```powershell
+python -m saas_pipeline.cli --layer silver --tenant hn --start-date 2025-01-01 --end-date 2025-06-30
+```
+
+## Paso 5 — Ejecutar Gold
+
+```powershell
+python -m saas_pipeline.cli --layer gold --tenant hn --start-date 2025-01-01 --end-date 2025-06-30
+```
+
+## Paso 6 — Validar
+
+Comprobar:
 
 ```text
-data/bronze/hn/deliveries/
+Bronze
+ ├── tenant correcto
+ ├── esquema correcto
+ └── particiones correctas
+
+Silver
+ ├── tenant correcto
+ ├── anomalías
+ ├── unidades
+ ├── SCD
+ └── enriquecimiento
+
+Gold
+ ├── tenant correcto
+ ├── granularidad
+ └── métricas
 ```
+
+El onboarding sigue el principio de que incorporar un tenant debe requerir principalmente configuración y disponibilidad de la fuente, no modificaciones de la lógica central. La arquitectura fue planteada precisamente para facilitar el onboarding mediante schemas por tenant.
 
 ---
 
-## Paso 4 — Validar Bronze
+# 20. Trazabilidad
 
-```bash
-pytest tests/test_bronze.py -v
-```
-
-Las validaciones deben confirmar:
-
-- esquema;
-- columnas;
-- tipos;
-- tenant;
-- particiones;
-- integridad RAW → Bronze.
-
----
-
-## Paso 5 — Ejecutar Silver
-
-```bash
-python -m saas_pipeline.cli \
-  --layer silver \
-  --tenant hn \
-  --start-date 2025-01-01 \
-  --end-date 2025-06-30
-```
-
-Se generarán:
-
-```text
-data/silver/hn/fact_deliveries/
-data/silver/hn/dim_materials/
-```
-
-y, cuando corresponda:
-
-```text
-data/silver_quarantine/hn/fact_deliveries/
-```
-
----
-
-## Paso 6 — Validar Silver
-
-```bash
-pytest tests/test_silver.py -v
-```
-
----
-
-# 20. Flujo de onboarding
-
-```text
-                 Nuevo tenant
-                      │
-                      ▼
-             Crear configuración
-                      │
-                      ▼
-              Incorporar RAW
-                      │
-                      ▼
-             Ejecutar Bronze
-                      │
-                      ▼
-             Validar Bronze
-                      │
-                      ▼
-             Ejecutar Silver
-                      │
-                      ▼
-             Validar Silver
-                      │
-                      ▼
-              Tenant habilitado
-```
-
-Este procedimiento permite mantener el aislamiento lógico por tenant sin modificar la lógica principal del pipeline.
-
----
-
-# 21. Validaciones implementadas
-
-## RAW → Bronze
-
-Se validan:
-
-- existencia de Bronze;
-- formato Delta;
-- existencia de registros;
-- columnas técnicas;
-- `_tenant_id`;
-- tenant esperado;
-- particiones;
-- columnas RAW;
-- ausencia de columnas inesperadas;
-- ausencia de columnas duplicadas;
-- tipos de datos;
-- cantidad de registros;
-- integridad de contenido.
-
-## Bronze → Silver
-
-Se validan:
-
-- estructura Delta;
-- lectura Delta;
-- existencia de registros;
-- tenant;
-- columnas requeridas;
-- tipos de entrega;
-- unidades ST;
-- flags;
-- cantidades;
-- precios;
-- fechas;
-- consistencia tenant/país;
-- enriquecimiento de materiales;
-- metadata técnica;
-- completitud de clave de negocio;
-- ausencia de claves duplicadas.
-
----
-
-# 22. Trazabilidad
-
-Bronze y Silver conservan información técnica para permitir seguimiento de las ejecuciones.
-
-Entre las columnas principales se encuentran:
+Las columnas técnicas permiten seguir el origen de un registro a través del pipeline:
 
 ```text
 _ingestion_timestamp
@@ -819,181 +956,212 @@ Ejemplo:
 _ingestion_timestamp = 2026-08-28 19:09:35
 _source_file         = global_mobility_data_entrega_productos.csv
 _tenant_id           = sv
-_batch_id            = <uuid>
+_batch_id            = <UUID>
 ```
 
 Esto permite identificar:
 
-- cuándo se procesó el registro;
-- cuál fue su archivo fuente;
+- cuándo fue ingerido;
+- de qué archivo provino;
 - a qué tenant pertenece;
-- qué ejecución lo generó.
+- qué ejecución generó el registro.
 
 ---
 
-# 23. Qué dejé fuera y por qué
+# 21. Qué dejé fuera y por qué
 
-La implementación actual se limita deliberadamente a:
+La implementación se mantiene dentro del alcance de un MVP reproducible y no incorpora componentes que requieren infraestructura externa o exceden los objetivos principales de la prueba.
 
-```text
-RAW → BRONZE → SILVER
-```
+## 21.1 Streaming / Auto Loader
 
-## 23.1 Capa Gold
+No se implementó streaming ni Auto Loader.
 
-Gold no se implementa todavía.
+La fuente proporcionada es un archivo CSV y el procesamiento implementado es batch.
 
-La razón es que el alcance actual termina en Silver y la implementación de Gold se realizará en una etapa posterior.
+Una futura evolución podría incorporar Auto Loader para fuentes continuas.
 
-Por lo tanto, no se han implementado todavía las tablas de métricas agregadas.
+La propia prueba técnica considera Auto Loader/streaming como una funcionalidad adicional.
 
 ---
 
-## 23.2 Procesamiento streaming
-
-No se implementó streaming.
-
-La fuente utilizada en la prueba es un conjunto de archivos CSV y el procesamiento se realiza mediante ejecución batch con PySpark.
-
-Esto permite concentrar el alcance en:
-
-- ingesta;
-- transformación;
-- calidad;
-- idempotencia;
-- multi-tenancy.
-
----
-
-## 23.3 ADLS Gen2
+## 21.2 ADLS Gen2
 
 No se implementó almacenamiento físico sobre ADLS Gen2.
 
-La prueba se ejecuta localmente utilizando:
+Se utilizan paths locales:
 
 ```text
 data/
 ```
 
-Esta estructura representa localmente el almacenamiento que posteriormente podría mapearse a ADLS.
+Esto permite reproducir el pipeline sin depender de una cuenta cloud.
+
+La arquitectura define explícitamente el mapeo entre los paths locales y la futura estructura en ADLS/Unity Catalog.
 
 ---
 
-## 23.4 Unity Catalog
+## 21.3 Unity Catalog
 
-No se implementó Unity Catalog.
+No se implementó Unity Catalog funcional.
 
-La separación por tenant se representa mediante paths:
+La separación lógica se representa mediante:
 
 ```text
-data/bronze/sv/
-data/silver/sv/
+data/bronze/<tenant>/
+data/silver/<tenant>/
+data/gold/<tenant>/
 ```
 
-en lugar de schemas administrados mediante Unity Catalog.
-
-La arquitectura objetivo define schemas como:
+En un entorno Databricks, estos paths podrían mapearse a:
 
 ```text
 saas_<env>.bronze_<tenant>
 saas_<env>.silver_<tenant>
+saas_<env>.gold_<tenant>
 ```
 
-pero la prueba utiliza paths locales equivalentes.
+La prueba técnica plantea esta estructura como el destino productivo.
 
 ---
 
-## 23.5 Infraestructura cloud ejecutable
+## 21.4 Terraform ejecutable
 
-No se implementó infraestructura cloud funcional.
+No se implementó infraestructura Terraform funcional contra un proveedor cloud.
 
-El proyecto se concentra actualmente en demostrar:
-
-- procesamiento de datos;
-- separación por capas;
-- aislamiento por tenant;
-- trazabilidad;
-- idempotencia;
-- calidad;
-- pruebas automatizadas.
-
----
-
-## 23.6 Optimización avanzada de Spark
-
-No se incorporaron optimizaciones específicas de grandes clusters productivos como:
-
-- tuning de particiones a escala;
-- configuración avanzada de shuffle;
-- cluster sizing;
-- autoscaling;
-- Photon;
-- optimización específica de infraestructura cloud.
-
-La ejecución actual es local y el volumen de la prueba no justifica introducir complejidad adicional.
-
----
-
-# 24. Documentación complementaria
+La infraestructura queda documentada conceptualmente en:
 
 ```text
-docs/
-├── observations.md
-├── onboarding-tenant.md
-└── infra.md
+docs/infra.md
 ```
 
-### `observations.md`
-
-Documenta:
-
-- decisiones técnicas;
-- ambigüedades;
-- trade-offs;
-- mejoras realizadas;
-- mejoras futuras.
-
-### `onboarding-tenant.md`
-
-Documenta el proceso de incorporación de un nuevo tenant.
-
-### `infra.md`
-
-Documenta la infraestructura objetivo y las consideraciones de despliegue.
+La prueba únicamente exige un snippet ilustrativo y no un `terraform plan` contra una cuenta real.
 
 ---
 
-# 25. Resultado actual
+## 21.5 Segunda tabla Gold
 
-La implementación validada actualmente es:
+No se implementó una segunda tabla Gold.
+
+El alcance obligatorio requería al menos:
 
 ```text
-                    RAW
-                     │
-                     ▼
-                  BRONZE
-                     │
-        ┌────────────┴────────────┐
-        │                         │
-   Validaciones             Idempotencia
-        │                         │
-        └────────────┬────────────┘
-                     ▼
-                  SILVER
-                     │
-          ┌──────────┴──────────┐
-          │                     │
-   fact_deliveries        dim_materials
-          │                     │
-          │                SCD Type 2
-          │                     │
-          └──────────┬──────────┘
-                     │
-              24 tests OK
-                     │
-                     ▼
-             Próxima etapa:
-                   GOLD
+daily_metrics_by_delivery_type
 ```
 
-El estado actual demuestra una implementación funcional de RAW, Bronze y Silver, con aislamiento por tenant, procesamiento parametrizable, manejo de anomalías, idempotencia, enriquecimiento temporal y validaciones automatizadas.
+Una segunda tabla, como top materiales por tenant y mes, se considera una extensión.
+
+La prueba la clasifica como bonus opcional.
+
+---
+
+## 21.6 Dashboard
+
+No se implementó un dashboard sobre Gold.
+
+La prioridad fue garantizar:
+
+```text
+correctitud
++
+calidad
++
+idempotencia
++
+multi-tenancy
++
+tests
+```
+
+La implementación de un dashboard en Databricks SQL o Streamlit queda como evolución posterior.
+
+---
+
+## 21.7 Optimización avanzada para producción
+
+No se incorporaron optimizaciones específicas de un cluster productivo distribuido, debido a que la ejecución actual se realiza localmente.
+
+Entre las optimizaciones que podrían evaluarse posteriormente están:
+
+- configuración de particiones;
+- broadcast joins;
+- AQE;
+- optimización de archivos pequeños;
+- Z-Ordering;
+- OPTIMIZE;
+- caching selectivo;
+- tuning de Spark.
+
+La prueba está orientada principalmente a demostrar la correcta implementación de las capas y sus contratos.
+
+---
+
+# 22. Estado final
+
+| Componente | Estado |
+|---|---|
+| Python | Implementado |
+| PySpark | Implementado |
+| Delta Lake | Implementado |
+| YAML / OmegaConf | Implementado |
+| CLI | Implementada |
+| RAW | Implementado |
+| Bronze | Implementado |
+| Silver | Implementado |
+| Gold | Implementado |
+| Multi-tenant | Implementado |
+| Idempotencia Bronze | Implementada |
+| Idempotencia Silver | Implementada |
+| Idempotencia Gold | Implementada |
+| Manejo de anomalías | Implementado |
+| Cuarentena | Implementada |
+| SCD Type 2 | Implementado |
+| Join temporal | Implementado |
+| Calidad de datos | Implementada |
+| Tests Bronze | Implementados |
+| Tests Silver | Implementados |
+| Tests Gold | Implementados |
+| CI/CD | Implementado según configuración del repositorio |
+| Infraestructura cloud | Fuera del alcance |
+| Unity Catalog funcional | Fuera del alcance |
+| Streaming | Fuera del alcance |
+| Dashboard | Fuera del alcance |
+
+---
+
+# 23. Principio de diseño final
+
+La separación de responsabilidades queda definida como:
+
+```text
+RAW
+ │
+ │ Datos originales
+ │ Sin transformación
+ ▼
+BRONZE
+ │
+ │ Ingesta
+ │ Delta
+ │ Trazabilidad
+ │ Particionado
+ │ Idempotencia
+ ▼
+SILVER
+ │
+ │ Limpieza
+ │ Normalización
+ │ Calidad
+ │ Anomalías
+ │ SCD Type 2
+ │ Enriquecimiento
+ ▼
+GOLD
+ │
+ │ Agregaciones
+ │ Métricas de negocio
+ │ Consumo analítico
+ ▼
+CONSUMO
+```
+
+El principio central de la implementación es mantener una separación clara entre **ingesta, transformación y consumo analítico**, de modo que Bronze preserve la información de origen, Silver represente datos confiables y normalizados, y Gold exponga métricas derivadas para análisis.

@@ -1,27 +1,32 @@
 from pathlib import Path
-from delta.tables import DeltaTable
 
 import pytest
-
 from delta import configure_spark_with_delta_pip
-
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 
-SILVER_PATH = Path("data/silver/sv/fact_deliveries")
-TENANT = "sv"
+# ---------------------------------------------------------------------------
+# PATHS
+# ---------------------------------------------------------------------------
 
-VALID_DELIVERY_TYPES = {
-    "ZPRE",
-    "ZVE1",
-    "Z04",
-    "Z05",
-}
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+SILVER_PATH = (
+    PROJECT_ROOT
+    / "data"
+    / "silver"
+    / "sv"
+    / "fact_deliveries"
+)
 
 
-def get_spark() -> SparkSession:
-    """Create Spark session configured for Delta Lake."""
+# ---------------------------------------------------------------------------
+# SPARK FIXTURE
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def spark():
     builder = (
         SparkSession.builder
         .master("local[1]")
@@ -36,549 +41,606 @@ def get_spark() -> SparkSession:
         )
     )
 
-    return configure_spark_with_delta_pip(builder).getOrCreate()
+    spark_session = configure_spark_with_delta_pip(
+        builder
+    ).getOrCreate()
+
+    spark_session.sparkContext.setLogLevel("ERROR")
+
+    yield spark_session
+
+    spark_session.stop()
 
 
-def get_silver_df(spark: SparkSession):
-    """Read the Silver fact_deliveries Delta table."""
+# ---------------------------------------------------------------------------
+# DATAFRAME FIXTURE
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def silver_df(spark):
+    if not SILVER_PATH.exists():
+        pytest.fail(
+            f"No existe la ruta Silver: {SILVER_PATH}"
+        )
+
     return (
         spark.read
         .format("delta")
         .load(str(SILVER_PATH))
     )
 
-def test_silver_delta_structure():
-    spark = get_spark()
 
-    try:
-        assert SILVER_PATH.exists(), (
-            f"No existe la ruta Silver: {SILVER_PATH}"
+# ---------------------------------------------------------------------------
+# 1. DELTA STRUCTURE
+# ---------------------------------------------------------------------------
+
+def test_silver_delta_structure(spark):
+    assert SILVER_PATH.exists(), (
+        f"No existe la ruta Silver: {SILVER_PATH}"
+    )
+
+    detail = (
+        spark.sql(
+            f"DESCRIBE DETAIL delta.`{SILVER_PATH}`"
         )
+        .select("format")
+        .first()
+    )
 
-        assert DeltaTable.isDeltaTable(
-            spark,
-            str(SILVER_PATH),
-        ), (
-            f"La ruta Silver no corresponde a una tabla Delta: "
-            f"{SILVER_PATH}"
+    assert detail is not None
+    assert detail["format"].lower() == "delta"
+
+
+# ---------------------------------------------------------------------------
+# 2. DELTA READ
+# ---------------------------------------------------------------------------
+
+def test_silver_can_be_read_as_delta(silver_df):
+    assert silver_df is not None
+
+
+# ---------------------------------------------------------------------------
+# 3. DATA EXISTS
+# ---------------------------------------------------------------------------
+
+def test_silver_contains_data(silver_df):
+    assert silver_df.limit(1).count() > 0
+
+
+# ---------------------------------------------------------------------------
+# 4. TENANT COLUMN
+# ---------------------------------------------------------------------------
+
+def test_silver_contains_tenant_column(silver_df):
+    assert "_tenant_id" in silver_df.columns
+
+
+# ---------------------------------------------------------------------------
+# 5. EXPECTED TENANT
+# ---------------------------------------------------------------------------
+
+def test_silver_contains_only_expected_tenant(silver_df):
+    tenants = {
+        row["_tenant_id"]
+        for row in (
+            silver_df
+            .select("_tenant_id")
+            .distinct()
+            .collect()
         )
+    }
 
-    finally:
-        spark.stop()
-
-def test_silver_can_be_read_as_delta():
-    spark = get_spark()
-
-    try:
-        df = get_silver_df(spark)
-
-        assert df is not None
-
-    finally:
-        spark.stop()
+    assert tenants == {"sv"}
 
 
-def test_silver_contains_data():
-    spark = get_spark()
+# ---------------------------------------------------------------------------
+# 6. NO DUPLICATE COLUMNS
+# ---------------------------------------------------------------------------
 
-    try:
-        df = get_silver_df(spark)
+def test_silver_has_no_duplicate_columns(silver_df):
+    columns = silver_df.columns
 
-        assert df.count() > 0, (
-            "Silver no contiene registros"
+    assert len(columns) == len(set(columns))
+
+
+# ---------------------------------------------------------------------------
+# 7. REQUIRED COLUMNS
+# ---------------------------------------------------------------------------
+
+def test_silver_contains_required_columns(silver_df):
+    required_columns = {
+        "pais",
+        "fecha_proceso",
+        "transporte",
+        "ruta",
+        "tipo_entrega",
+        "material",
+        "precio",
+        "cantidad",
+        "unidad",
+        "_ingestion_timestamp",
+        "_source_file",
+        "_tenant_id",
+        "_batch_id",
+        "_fecha_proceso_date",
+        "is_routine_delivery",
+        "is_bonus_delivery",
+        "descripcion",
+        "categoria",
+        "precio_base",
+        "cantidad_normalizada_st",
+        "precio_transaccion",
+    }
+
+    missing = required_columns - set(silver_df.columns)
+
+    assert not missing, (
+        f"Faltan columnas requeridas en Silver: "
+        f"{sorted(missing)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 8. VALID DELIVERY TYPES
+# ---------------------------------------------------------------------------
+
+def test_silver_delivery_types_are_valid(silver_df):
+    valid_types = {
+        "ZPRE",
+        "ZVE1",
+        "Z04",
+        "Z05",
+    }
+
+    invalid_count = (
+        silver_df
+        .filter(
+            ~F.col("tipo_entrega").isin(valid_types)
         )
+        .count()
+    )
 
-    finally:
-        spark.stop()
+    assert invalid_count == 0
 
 
-def test_silver_contains_tenant_column():
-    spark = get_spark()
+# ---------------------------------------------------------------------------
+# 9. UNIT NORMALIZATION
+# ---------------------------------------------------------------------------
 
-    try:
-        df = get_silver_df(spark)
-
-        assert "_tenant_id" in df.columns, (
-            "Silver no contiene la columna técnica _tenant_id"
+def test_silver_units_are_normalized_to_st(silver_df):
+    invalid_units = (
+        silver_df
+        .filter(
+            ~F.upper(
+                F.trim(F.col("unidad"))
+            ).isin("CS", "ST")
         )
+        .count()
+    )
 
-    finally:
-        spark.stop()
+    assert invalid_units == 0
 
 
-def test_silver_contains_only_expected_tenant():
-    spark = get_spark()
+# ---------------------------------------------------------------------------
+# 10. NORMALIZED QUANTITY EXISTS
+# ---------------------------------------------------------------------------
 
-    try:
-        df = get_silver_df(spark)
+def test_silver_contains_normalized_quantity(silver_df):
+    assert "cantidad_normalizada_st" in silver_df.columns
 
-        tenants = {
-            row["_tenant_id"]
-            for row in (
-                df.select("_tenant_id")
-                .distinct()
-                .collect()
-            )
-        }
 
-        assert tenants == {TENANT}, (
-            f"Tenants encontrados en Silver: {tenants}"
+# ---------------------------------------------------------------------------
+# 11. NORMALIZED QUANTITY IS NOT NULL
+# ---------------------------------------------------------------------------
+
+def test_silver_normalized_quantity_is_not_null(
+    silver_df,
+):
+    null_count = (
+        silver_df
+        .filter(
+            F.col("cantidad_normalizada_st").isNull()
         )
+        .count()
+    )
 
-    finally:
-        spark.stop()
+    assert null_count == 0
 
 
-def test_silver_has_no_duplicate_columns():
-    spark = get_spark()
+# ---------------------------------------------------------------------------
+# 12. NORMALIZED QUANTITY IS POSITIVE
+# ---------------------------------------------------------------------------
 
-    try:
-        df = get_silver_df(spark)
-
-        columns_lower = [
-            column.lower()
-            for column in df.columns
-        ]
-
-        assert len(columns_lower) == len(set(columns_lower)), (
-            "Silver contiene columnas duplicadas"
+def test_silver_normalized_quantity_is_positive(
+    silver_df,
+):
+    invalid_count = (
+        silver_df
+        .filter(
+            F.col("cantidad_normalizada_st") <= 0
         )
+        .count()
+    )
 
-    finally:
-        spark.stop()
+    assert invalid_count == 0
 
 
-def test_silver_contains_required_columns():
-    spark = get_spark()
+# ---------------------------------------------------------------------------
+# 13. CS -> ST CONVERSION
+# ---------------------------------------------------------------------------
 
-    try:
-        df = get_silver_df(spark)
-
-        required_columns = {
-            "pais",
-            "fecha_proceso",
-            "transporte",
-            "ruta",
-            "tipo_entrega",
-            "material",
-            "precio",
-            "cantidad",
-            "unidad",
-            "_ingestion_timestamp",
-            "_source_file",
-            "_tenant_id",
-            "_batch_id",
-            "is_routine_delivery",
-            "is_bonus_delivery",
-        }
-
-        missing_columns = (
-            required_columns
-            - set(df.columns)
+def test_silver_cs_quantity_is_converted_to_st(
+    silver_df,
+):
+    invalid_conversion_count = (
+        silver_df
+        .filter(
+            F.upper(
+                F.trim(F.col("unidad"))
+            ) == "CS"
         )
-
-        assert not missing_columns, (
-            f"Faltan columnas requeridas en Silver: "
-            f"{missing_columns}"
+        .filter(
+            F.col("cantidad_normalizada_st")
+            != F.col("cantidad") * F.lit(20)
         )
+        .count()
+    )
 
-    finally:
-        spark.stop()
+    assert invalid_conversion_count == 0
 
 
-def test_silver_delivery_types_are_valid():
-    spark = get_spark()
+# ---------------------------------------------------------------------------
+# 14. ST REMAINS ST
+# ---------------------------------------------------------------------------
 
-    try:
-        df = get_silver_df(spark)
+def test_silver_st_quantity_is_preserved(
+    silver_df,
+):
+    invalid_conversion_count = (
+        silver_df
+        .filter(
+            F.upper(
+                F.trim(F.col("unidad"))
+            ) == "ST"
+        )
+        .filter(
+            F.col("cantidad_normalizada_st")
+            != F.col("cantidad")
+        )
+        .count()
+    )
 
-        invalid_count = (
-            df.filter(
-                ~F.col("tipo_entrega").isin(
-                    list(VALID_DELIVERY_TYPES)
+    assert invalid_conversion_count == 0
+
+
+# ---------------------------------------------------------------------------
+# 15. TRANSACTION PRICE EXISTS
+# ---------------------------------------------------------------------------
+
+def test_silver_contains_transaction_price(silver_df):
+    assert "precio_transaccion" in silver_df.columns
+
+
+# ---------------------------------------------------------------------------
+# 16. TRANSACTION PRICE IS NOT NULL
+# ---------------------------------------------------------------------------
+
+def test_silver_transaction_price_is_not_null(
+    silver_df,
+):
+    null_count = (
+        silver_df
+        .filter(
+            F.col("precio_transaccion").isNull()
+        )
+        .count()
+    )
+
+    assert null_count == 0
+
+
+# ---------------------------------------------------------------------------
+# 17. TRANSACTION PRICE MATCHES ORIGINAL PRICE
+# ---------------------------------------------------------------------------
+
+def test_silver_transaction_price_matches_price(
+    silver_df,
+):
+    mismatch_count = (
+        silver_df
+        .filter(
+            F.col("precio_transaccion")
+            != F.col("precio")
+        )
+        .count()
+    )
+
+    assert mismatch_count == 0
+
+
+# ---------------------------------------------------------------------------
+# 18. DELIVERY FLAGS
+# ---------------------------------------------------------------------------
+
+def test_silver_contains_delivery_flags(silver_df):
+    assert "is_routine_delivery" in silver_df.columns
+    assert "is_bonus_delivery" in silver_df.columns
+
+
+# ---------------------------------------------------------------------------
+# 19. ROUTINE FLAG
+# ---------------------------------------------------------------------------
+
+def test_routine_delivery_flag_is_consistent(
+    silver_df,
+):
+    invalid_count = (
+        silver_df
+        .filter(
+            (
+                F.col("tipo_entrega").isin(
+                    "ZPRE",
+                    "ZVE1",
                 )
             )
-            .count()
+            != F.col("is_routine_delivery")
         )
+        .count()
+    )
 
-        assert invalid_count == 0, (
-            f"Existen {invalid_count} registros "
-            "con tipo_entrega fuera del alcance Silver"
-        )
-
-    finally:
-        spark.stop()
+    assert invalid_count == 0
 
 
-def test_silver_units_are_normalized_to_st():
-    spark = get_spark()
+# ---------------------------------------------------------------------------
+# 20. BONUS FLAG
+# ---------------------------------------------------------------------------
 
-    try:
-        df = get_silver_df(spark)
-
-        invalid_count = (
-            df.filter(
-                F.col("unidad") != "ST"
-            )
-            .count()
-        )
-
-        assert invalid_count == 0, (
-            f"Existen {invalid_count} registros "
-            "cuya unidad no está normalizada a ST"
-        )
-
-    finally:
-        spark.stop()
-
-
-def test_silver_contains_delivery_flags():
-    spark = get_spark()
-
-    try:
-        df = get_silver_df(spark)
-
-        assert "is_routine_delivery" in df.columns
-        assert "is_bonus_delivery" in df.columns
-
-    finally:
-        spark.stop()
-
-
-def test_routine_delivery_flag_is_consistent():
-    spark = get_spark()
-
-    try:
-        df = get_silver_df(spark)
-
-        invalid_count = (
-            df.filter(
-                (
-                    F.col("tipo_entrega").isin(
-                        ["ZPRE", "ZVE1"]
-                    )
+def test_bonus_delivery_flag_is_consistent(
+    silver_df,
+):
+    invalid_count = (
+        silver_df
+        .filter(
+            (
+                F.col("tipo_entrega").isin(
+                    "Z04",
+                    "Z05",
                 )
-                != F.col("is_routine_delivery")
             )
-            .count()
+            != F.col("is_bonus_delivery")
         )
+        .count()
+    )
 
-        assert invalid_count == 0, (
-            "is_routine_delivery no es consistente "
-            "con tipo_entrega"
+    assert invalid_count == 0
+
+
+# ---------------------------------------------------------------------------
+# 21. QUANTITY
+# ---------------------------------------------------------------------------
+
+def test_silver_has_valid_quantity(silver_df):
+    invalid_count = (
+        silver_df
+        .filter(
+            F.col("cantidad").isNull()
+            | (F.col("cantidad") <= 0)
         )
+        .count()
+    )
 
-    finally:
-        spark.stop()
+    assert invalid_count == 0
 
 
-def test_bonus_delivery_flag_is_consistent():
-    spark = get_spark()
+# ---------------------------------------------------------------------------
+# 22. PRICE
+# ---------------------------------------------------------------------------
 
-    try:
-        df = get_silver_df(spark)
-
-        invalid_count = (
-            df.filter(
-                (
-                    F.col("tipo_entrega").isin(
-                        ["Z04", "Z05"]
-                    )
-                )
-                != F.col("is_bonus_delivery")
-            )
-            .count()
+def test_silver_has_valid_price(silver_df):
+    invalid_count = (
+        silver_df
+        .filter(
+            F.col("precio").isNull()
+            | (F.col("precio") <= 0)
         )
+        .count()
+    )
 
-        assert invalid_count == 0, (
-            "is_bonus_delivery no es consistente "
-            "con tipo_entrega"
+    assert invalid_count == 0
+
+
+# ---------------------------------------------------------------------------
+# 23. DATE
+# ---------------------------------------------------------------------------
+
+def test_silver_has_valid_date(silver_df):
+    invalid_count = (
+        silver_df
+        .filter(
+            F.col("_fecha_proceso_date").isNull()
         )
+        .count()
+    )
 
-    finally:
-        spark.stop()
+    assert invalid_count == 0
 
 
-def test_silver_has_valid_quantity():
-    spark = get_spark()
+# ---------------------------------------------------------------------------
+# 24. TENANT / COUNTRY CONSISTENCY
+# ---------------------------------------------------------------------------
 
-    try:
-        df = get_silver_df(spark)
-
-        invalid_count = (
-            df.filter(
-                F.col("cantidad").isNull()
-                | (F.col("cantidad") <= 0)
-            )
-            .count()
+def test_silver_tenant_is_consistent_with_country(
+    silver_df,
+):
+    invalid_count = (
+        silver_df
+        .filter(
+            F.col("_tenant_id") != "sv"
         )
+        .count()
+    )
 
-        assert invalid_count == 0, (
-            f"Existen {invalid_count} registros "
-            "con cantidad nula, cero o negativa"
+    assert invalid_count == 0
+
+
+# ---------------------------------------------------------------------------
+# 25. MATERIAL DESCRIPTION
+# ---------------------------------------------------------------------------
+
+def test_silver_contains_material_description(
+    silver_df,
+):
+    assert "descripcion" in silver_df.columns
+
+    assert (
+        silver_df
+        .filter(F.col("descripcion").isNull())
+        .count()
+        == 0
+    )
+
+
+# ---------------------------------------------------------------------------
+# 26. MATERIAL CATEGORY
+# ---------------------------------------------------------------------------
+
+def test_silver_contains_material_category(
+    silver_df,
+):
+    assert "categoria" in silver_df.columns
+
+    assert (
+        silver_df
+        .filter(F.col("categoria").isNull())
+        .count()
+        == 0
+    )
+
+
+# ---------------------------------------------------------------------------
+# 27. MATERIAL BASE PRICE
+# ---------------------------------------------------------------------------
+
+def test_silver_contains_material_base_price(
+    silver_df,
+):
+    assert "precio_base" in silver_df.columns
+
+    assert (
+        silver_df
+        .filter(F.col("precio_base").isNull())
+        .count()
+        == 0
+    )
+
+
+# ---------------------------------------------------------------------------
+# 28. MATERIAL ENRICHMENT
+# ---------------------------------------------------------------------------
+
+def test_silver_materials_are_enriched(silver_df):
+    missing_material_count = (
+        silver_df
+        .filter(
+            F.col("descripcion").isNull()
+            | F.col("categoria").isNull()
+            | F.col("precio_base").isNull()
         )
+        .count()
+    )
 
-    finally:
-        spark.stop()
+    assert missing_material_count == 0
 
 
-def test_silver_has_valid_price():
-    spark = get_spark()
+# ---------------------------------------------------------------------------
+# 29. BATCH ID
+# ---------------------------------------------------------------------------
 
-    try:
-        df = get_silver_df(spark)
+def test_silver_has_batch_id(silver_df):
+    assert "_batch_id" in silver_df.columns
 
-        invalid_count = (
-            df.filter(
-                F.col("precio").isNull()
-            )
-            .count()
+    assert (
+        silver_df
+        .filter(F.col("_batch_id").isNull())
+        .count()
+        == 0
+    )
+
+
+# ---------------------------------------------------------------------------
+# 30. INGESTION TIMESTAMP
+# ---------------------------------------------------------------------------
+
+def test_silver_has_ingestion_timestamp(silver_df):
+    assert "_ingestion_timestamp" in silver_df.columns
+
+    assert (
+        silver_df
+        .filter(
+            F.col("_ingestion_timestamp").isNull()
         )
-
-        assert invalid_count == 0, (
-            f"Existen {invalid_count} registros "
-            "con precio nulo"
-        )
-
-    finally:
-        spark.stop()
-
-
-def test_silver_has_valid_date():
-    spark = get_spark()
-
-    try:
-        df = get_silver_df(spark)
-
-        invalid_count = (
-            df.filter(
-                F.col("fecha_proceso").isNull()
-            )
-            .count()
-        )
-
-        assert invalid_count == 0, (
-            f"Existen {invalid_count} registros "
-            "con fecha_proceso nula"
-        )
-
-    finally:
-        spark.stop()
-
-
-def test_silver_tenant_is_consistent_with_country():
-    spark = get_spark()
-
-    try:
-        df = get_silver_df(spark)
-
-        invalid_count = (
-            df.filter(
-                F.lower(F.col("pais"))
-                != F.lower(F.col("_tenant_id"))
-            )
-            .count()
-        )
-
-        assert invalid_count == 0, (
-            "Existen registros donde pais y "
-            "_tenant_id son inconsistentes"
-        )
-
-    finally:
-        spark.stop()
-
-
-def test_silver_contains_material_description():
-    spark = get_spark()
-
-    try:
-        df = get_silver_df(spark)
-
-        assert "descripcion" in df.columns, (
-            "Silver no contiene descripcion "
-            "del catálogo de materiales"
-        )
-
-    finally:
-        spark.stop()
-
-
-def test_silver_contains_material_category():
-    spark = get_spark()
-
-    try:
-        df = get_silver_df(spark)
-
-        assert "categoria" in df.columns, (
-            "Silver no contiene categoria "
-            "del catálogo de materiales"
-        )
-
-    finally:
-        spark.stop()
-
-
-def test_silver_contains_material_base_price():
-    spark = get_spark()
-
-    try:
-        df = get_silver_df(spark)
-
-        assert "precio_base" in df.columns, (
-            "Silver no contiene precio_base "
-            "del catálogo de materiales"
-        )
-
-    finally:
-        spark.stop()
-
-
-def test_silver_materials_are_enriched():
-    spark = get_spark()
-
-    try:
-        df = get_silver_df(spark)
-
-        missing_material_count = (
-            df.filter(
-                F.col("material").isNull()
-            )
-            .count()
-        )
-
-        assert missing_material_count == 0, (
-            "Existen registros Silver sin material"
-        )
-
-        missing_description_count = (
-            df.filter(
-                F.col("descripcion").isNull()
-            )
-            .count()
-        )
-
-        assert missing_description_count == 0, (
-            "Existen materiales Silver sin "
-            "descripcion proveniente del catálogo"
-        )
-
-    finally:
-        spark.stop()
-
-
-def test_silver_has_batch_id():
-    spark = get_spark()
-
-    try:
-        df = get_silver_df(spark)
-
-        assert "_batch_id" in df.columns
-
-        null_batch_count = (
-            df.filter(
-                F.col("_batch_id").isNull()
-            )
-            .count()
-        )
-
-        assert null_batch_count == 0, (
-            "Existen registros Silver sin _batch_id"
-        )
-
-    finally:
-        spark.stop()
-
-
-def test_silver_has_ingestion_timestamp():
-    spark = get_spark()
-
-    try:
-        df = get_silver_df(spark)
-
-        assert "_ingestion_timestamp" in df.columns
-
-        null_timestamp_count = (
-            df.filter(
-                F.col("_ingestion_timestamp").isNull()
-            )
-            .count()
-        )
-
-        assert null_timestamp_count == 0, (
-            "Existen registros Silver sin "
-            "_ingestion_timestamp"
-        )
-
-    finally:
-        spark.stop()
-
-
-def test_silver_has_no_null_business_key_columns():
-    spark = get_spark()
-
-    try:
-        df = get_silver_df(spark)
-
-        business_key = [
-            "_tenant_id",
-            "fecha_proceso",
-            "transporte",
-            "ruta",
-            "material",
-            "tipo_entrega",
-        ]
-
-        condition = None
-
-        for column in business_key:
-            current = F.col(column).isNull()
-
-            if condition is None:
-                condition = current
-            else:
-                condition = condition | current
-
-        invalid_count = (
-            df.filter(condition)
-            .count()
-        )
-
-        assert invalid_count == 0, (
-            f"Existen {invalid_count} registros "
-            "con columnas nulas en la clave de negocio"
-        )
-
-    finally:
-        spark.stop()
-
-
-def test_silver_has_no_duplicate_business_keys():
-    spark = get_spark()
-
-    try:
-        df = get_silver_df(spark)
-
-        key_columns = [
-            "_tenant_id",
-            "fecha_proceso",
-            "transporte",
-            "ruta",
-            "material",
-            "tipo_entrega",
-        ]
-
-        duplicate_count = (
-            df.groupBy(*key_columns)
-            .count()
-            .filter(F.col("count") > 1)
-            .count()
-        )
-
-        assert duplicate_count == 0, (
-            f"Existen {duplicate_count} claves de negocio "
-            "duplicadas en fact_deliveries"
-        )
-
-    finally:
-        spark.stop()
+        .count()
+        == 0
+    )
+
+
+# ---------------------------------------------------------------------------
+# 31. BUSINESS KEY NOT NULL
+# ---------------------------------------------------------------------------
+
+def test_silver_has_no_null_business_key_columns(
+    silver_df,
+):
+    business_key = [
+        "_tenant_id",
+        "fecha_proceso",
+        "transporte",
+        "ruta",
+        "material",
+        "tipo_entrega",
+    ]
+
+    condition = None
+
+    for column in business_key:
+        current_condition = F.col(column).isNull()
+
+        if condition is None:
+            condition = current_condition
+        else:
+            condition = condition | current_condition
+
+    invalid_count = (
+        silver_df
+        .filter(condition)
+        .count()
+    )
+
+    assert invalid_count == 0
+
+
+# ---------------------------------------------------------------------------
+# 32. BUSINESS KEY UNIQUENESS
+# ---------------------------------------------------------------------------
+
+def test_silver_has_no_duplicate_business_keys(
+    silver_df,
+):
+    business_key = [
+        "_tenant_id",
+        "fecha_proceso",
+        "transporte",
+        "ruta",
+        "material",
+        "tipo_entrega",
+    ]
+
+    duplicate_count = (
+        silver_df
+        .groupBy(*business_key)
+        .count()
+        .filter(F.col("count") > 1)
+        .count()
+    )
+
+    assert duplicate_count == 0

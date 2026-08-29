@@ -1,864 +1,620 @@
-# Observaciones y mejoras — RAW → BRONZE → SILVER
+# Observaciones sobre la arquitectura
 
-## 1. Objetivo
+## 1. Aislamiento por tenant mediante schemas independientes
 
-Este documento registra las observaciones, decisiones técnicas y mejoras identificadas durante la implementación de las capas **RAW, BRONZE y SILVER** de la plataforma de datos.
+### Tipo
 
-El objetivo es mantener trazabilidad sobre:
+Decisión de arquitectura con la que tengo una consideración.
 
-- decisiones tomadas durante la implementación;
-- diferencias o ambigüedades encontradas respecto de la arquitectura provista;
-- criterios utilizados para resolver dichas ambigüedades;
-- mejoras tecnológicas identificadas para futuras iteraciones.
+### Arquitectura propuesta
 
-La arquitectura de referencia establece una separación clara entre RAW, Bronze, Silver y Gold. RAW conserva los archivos fuente; Bronze preserva el esquema original y agrega metadatos técnicos; Silver constituye la zona limpia, normalizada y enriquecida para consumo analítico.
-
-El alcance actual de este documento comprende exclusivamente las capas **RAW, BRONZE y SILVER**. Las observaciones relacionadas con Gold se documentarán cuando dicha capa sea implementada.
-
----
-
-# 2. Arquitectura implementada
-
-La implementación actual sigue el siguiente flujo:
+La arquitectura productiva plantea un catálogo único por ambiente y un schema independiente para cada tenant:
 
 ```text
-                         ┌─────────────────────────┐
-                         │          RAW            │
-                         │                         │
-                         │ CSV original            │
-                         │ Sin transformación      │
-                         └────────────┬────────────┘
-                                      │
-                                      │ Ingesta
-                                      ▼
-                         ┌─────────────────────────┐
-                         │        BRONZE           │
-                         │                         │
-                         │ Delta                   │
-                         │ Esquema original        │
-                         │ + columnas técnicas     │
-                         │ Particionado            │
-                         └────────────┬────────────┘
-                                      │
-                                      │ Transformación
-                                      ▼
-              ┌─────────────────────────────────────────────┐
-              │                   SILVER                    │
-              │                                             │
-              │  fact_deliveries       dim_materials        │
-              │  - Datos limpios        - SCD Type 2        │
-              │  - Unidades ST          - Material          │
-              │  - Flags                - Descripción       │
-              │  - Anomalías            - Categoría         │
-              │  - Enriquecimiento      - Precio base      │
-              └──────────────────────┬──────────────────────┘
-                                     │
-                                     ▼
-                              GOLD (siguiente etapa)
+saas_<env>.bronze_<tenant>
+saas_<env>.silver_<tenant>
+saas_<env>.gold_<tenant>
 ```
 
-La estructura local utilizada sigue la convención definida por la arquitectura:
+Por ejemplo:
 
 ```text
-data/
-├── raw/
-│   └── archivos fuente
-│
-├── bronze/
-│   └── <tenant>/
-│       └── deliveries/
-│           └── fecha_proceso=YYYYMMDD/
-│
-├── silver/
-│   └── <tenant>/
-│       ├── fact_deliveries/
-│       │   └── fecha_proceso=YYYYMMDD/
-│       │
-│       └── dim_materials/
-│
-├── silver_quarantine/
-│   └── <tenant>/
-│       └── fact_deliveries/
-│
-└── shared/
-    └── quality_logs/
+saas_dev.bronze_sv.deliveries
+saas_dev.silver_sv.fact_deliveries
+saas_dev.gold_sv.daily_metrics_by_delivery_type
 ```
 
-La arquitectura especifica que Bronze debe particionarse por `fecha_proceso` y tenant, mientras que `fact_deliveries` debe particionarse por `fecha_proceso` y `dim_materials` no requiere particionamiento debido a su baja cardinalidad.
+La motivación es facilitar el onboarding y mantener gobierno centralizado.
 
----
+### Consideración
 
-# 3. Observaciones sobre la capa RAW
+Para una plataforma con un número reducido o moderado de tenants considero razonable esta estrategia. Sin embargo, a medida que el número de tenants crezca significativamente, mantener múltiples schemas y gestionar permisos individualmente puede incrementar la complejidad operativa.
 
-## OBS-RAW-001 — RAW debe conservar los archivos fuente originales
+### Propuesta alternativa
 
-### Observación
-
-La capa RAW debe considerarse como la representación más cercana posible a la fuente de origen.
-
-Los archivos CSV deben conservarse sin aplicar transformaciones de negocio, filtros, agregaciones, eliminación de registros o modificaciones sobre sus valores originales.
-
-### Importancia
-
-La conservación de los datos originales permite:
-
-- reproducir una ejecución;
-- investigar errores;
-- comparar RAW contra BRONZE;
-- recuperar información ante errores posteriores;
-- disponer de una fuente de auditoría;
-- validar que las transformaciones posteriores no alteren indebidamente los datos.
-
-### Decisión / mejora aplicada
-
-Se mantiene RAW como zona de aterrizaje de los archivos originales.
-
-No se utiliza RAW como zona para realizar transformaciones de negocio.
-
----
-
-## OBS-RAW-002 — No utilizar pandas para procesar RAW → BRONZE
-
-### Observación
-
-El procesamiento de los archivos debe realizarse utilizando Spark, evitando cargar el dataset completo en memoria mediante pandas.
-
-### Importancia
-
-El uso de pandas limita la escalabilidad del pipeline y puede provocar problemas de memoria cuando el volumen de datos aumente.
-
-Además, el objetivo de la arquitectura es mantener un procesamiento distribuido mediante Spark.
-
-### Decisión / mejora aplicada
-
-La lectura y procesamiento de los archivos RAW se realiza mediante:
-
-```python
-spark.read.csv(...)
-```
-
-y las transformaciones mediante operaciones nativas de Spark DataFrame.
-
-No se utiliza pandas para el procesamiento de RAW → BRONZE.
-
----
-
-## OBS-RAW-003 — Evitar modificaciones sobre el archivo fuente
-
-### Observación
-
-No se debe modificar físicamente el archivo CSV original para solucionar problemas de formato, tipos o calidad de datos durante el proceso de ingestión.
-
-### Importancia
-
-Modificar el archivo fuente rompe la trazabilidad y dificulta determinar qué información llegó originalmente desde el sistema origen.
-
-### Mejora recomendada
-
-Cualquier normalización necesaria debe realizarse en una capa posterior al aterrizaje, manteniendo intacto el archivo RAW.
-
----
-
-## OBS-RAW-004 — Validación de existencia de archivos fuente
-
-### Observación
-
-El pipeline depende de la existencia de los archivos esperados dentro de `data/raw`.
-
-### Importancia
-
-Una ejecución sin el archivo requerido podría producir errores poco descriptivos o generar resultados incompletos.
-
-### Mejora recomendada
-
-Incorporar validaciones explícitas al inicio del proceso para verificar:
-
-- existencia del archivo;
-- nombre esperado;
-- extensión;
-- tamaño del archivo;
-- existencia de encabezados;
-- estructura mínima esperada.
-
-Esto permitiría fallar rápidamente con un mensaje funcional y no con un error interno de Spark.
-
----
-
-## OBS-RAW-005 — Validación de esquema del archivo fuente
-
-### Observación
-
-La inferencia automática de esquema mediante:
-
-```python
-.option("inferSchema", True)
-```
-
-es conveniente durante el desarrollo, pero puede producir diferencias de tipo dependiendo del contenido del archivo.
-
-### Importancia
-
-La inferencia de tipos puede generar comportamientos diferentes si el contenido de los archivos cambia entre ejecuciones.
-
-### Mejora recomendada
-
-Definir progresivamente un esquema explícito para los archivos RAW cuando el contrato de datos del origen esté formalizado.
-
-La implementación actual mantiene la inferencia para facilitar la ejecución de la prueba técnica.
-
----
-
-# 4. Observaciones sobre la capa BRONZE
-
-## OBS-BRZ-001 — BRONZE debe conservar todas las columnas originales
-
-### Observación
-
-Bronze debe preservar las columnas provenientes de RAW y agregar únicamente las columnas técnicas requeridas.
-
-### Importancia
-
-Bronze funciona como una copia persistente y trazable de la fuente, por lo que eliminar o modificar columnas originales dificulta la auditoría y la recuperación.
-
-### Decisión / mejora aplicada
-
-Se implementaron validaciones automatizadas que comprueban:
-
-- presencia de todas las columnas RAW;
-- ausencia de columnas inesperadas;
-- ausencia de columnas duplicadas;
-- tipos de datos esperados;
-- presencia de columnas técnicas.
-
-La validación RAW → Bronze se ejecutó exitosamente.
-
----
-
-## OBS-BRZ-002 — Particionado por fecha y tenant
-
-### Observación
-
-La arquitectura establece que Bronze debe particionarse mediante `fecha_proceso` y `_tenant_id`.
-
-### Decisión / mejora aplicada
-
-La escritura Bronze utiliza particionamiento por:
+Mantendría un esquema lógico común para las tablas compartidas, utilizando `_tenant_id` como columna obligatoria de aislamiento:
 
 ```text
-fecha_proceso
-_tenant_id
+saas_<env>.bronze.deliveries
+saas_<env>.silver.fact_deliveries
+saas_<env>.gold.daily_metrics_by_delivery_type
 ```
 
-Esto permite:
+y complementaría el modelo con:
 
-- aislamiento lógico por tenant;
-- lectura eficiente por rango de fechas;
-- reprocesamiento controlado;
-- alineamiento con la arquitectura definida.
+- row-level security;
+- políticas de acceso por tenant;
+- catálogo centralizado de tenants;
+- controles de acceso administrados.
+
+### Trade-offs
+
+**Ventajas:**
+
+- menor cantidad de objetos en el catálogo;
+- menor complejidad administrativa;
+- facilita análisis cross-tenant;
+- facilita operaciones masivas.
+
+**Desventajas:**
+
+- requiere controles de seguridad más estrictos;
+- un error de filtrado por `_tenant_id` puede provocar exposición entre tenants;
+- el aislamiento lógico depende más de las políticas de acceso.
+
+### Decisión adoptada
+
+No modifiqué la arquitectura provista. Para la prueba implementé el aislamiento mediante paths:
+
+```text
+data/<layer>/<tenant>/
+```
+
+manteniendo la separación definida y dejando la alternativa como consideración para una evolución futura.
 
 ---
 
-## OBS-BRZ-003 — Idempotencia mediante overwrite por partición
+# 2. Ambigüedad en la semántica de precio y revenue
 
-### Observación
+### Tipo
 
-La arquitectura define `replaceWhere` o mecanismo equivalente para evitar duplicados durante reprocesos.
+Ambigüedad resuelta durante la implementación.
 
-### Decisión / mejora aplicada
+### Problema
 
-Bronze utiliza:
+Silver contiene tanto:
 
 ```text
-mode("overwrite")
-replaceWhere(...)
+precio
 ```
 
-limitando el reemplazo al tenant y rango de fechas procesado.
+como:
 
-Una segunda ejecución del mismo rango no genera duplicados.
+```text
+precio_base
+```
+
+El primero proviene de la transacción, mientras que el segundo corresponde al catálogo.
+
+Esto puede generar ambigüedad al momento de construir Gold.
+
+### Resolución
+
+Se introdujo explícitamente el concepto:
+
+```text
+precio_transaccion
+```
+
+manteniendo:
+
+```text
+precio_base
+```
+
+como atributo informativo proveniente de la dimensión de materiales.
+
+De esta manera:
+
+```text
+precio_transaccion
+        │
+        ▼
+cantidad_normalizada_st × precio_transaccion
+        │
+        ▼
+total_revenue
+```
+
+mientras que:
+
+```text
+precio_base
+```
+
+no participa en el cálculo de revenue.
+
+Esta resolución sigue directamente el contrato de Gold, que establece que el revenue debe utilizar el precio de la transacción y no el precio base del catálogo.
+
+### Motivo
+
+La explicitud semántica reduce el riesgo de utilizar accidentalmente el precio incorrecto en futuras transformaciones.
 
 ---
 
-## OBS-BRZ-004 — Trazabilidad mediante columnas técnicas
+# 3. Ambigüedad en la representación de la cantidad normalizada
 
-### Observación
+### Tipo
 
-La arquitectura requiere:
+Ambigüedad resuelta durante la implementación.
 
-```text
-_ingestion_timestamp
-_source_file
-_tenant_id
-_batch_id
-```
+### Problema
 
-### Decisión / mejora aplicada
+La arquitectura exige que Gold utilice la cantidad normalizada a ST, pero Bronze conserva la cantidad original y la unidad de origen.
 
-Estas columnas se incorporan durante la ingestión Bronze.
-
-Esto permite identificar:
-
-- cuándo fue procesado el registro;
-- desde qué archivo provino;
-- a qué tenant pertenece;
-- qué ejecución produjo el registro.
-
----
-
-## OBS-BRZ-005 — Las anomalías de negocio permanecen fuera de Bronze
-
-### Observación
-
-Durante la revisión de la arquitectura se identificó que las reglas de anomalías corresponden a la lógica de procesamiento de Silver.
-
-### Decisión / mejora aplicada
-
-Bronze no descarta ni pone en cuarentena registros por:
-
-- cantidades inválidas;
-- precios nulos;
-- materiales inexistentes;
-- tipos de entrega fuera del alcance analítico.
-
-La responsabilidad de estas reglas se mantiene en Silver, donde pueden clasificarse, auditarse y persistirse de acuerdo con la política definida.
-
-Esta decisión evita convertir Bronze en una capa de transformación de negocio y mantiene su función como capa de ingesta y trazabilidad.
-
----
-
-# 5. Observaciones sobre la capa SILVER
-
-## OBS-SLV-001 — La arquitectura no especifica completamente el orden de aplicación de las reglas de calidad
-
-### Observación
-
-La arquitectura define las reglas de anomalías, normalización, filtrado y enriquecimiento, pero no establece explícitamente el orden exacto en que deben ejecutarse.
-
-Esto es particularmente importante para la fecha, ya que una fecha inválida no debe eliminarse antes de ser clasificada como anomalía.
-
-### Decisión / resolución aplicada
-
-Se estableció el siguiente orden lógico:
+Por ejemplo:
 
 ```text
-BRONZE
-   │
-   ▼
-Normalización de fecha
-   │
-   ▼
-Clasificación de anomalías
-   │
-   ├──────────────► Cuarentena
-   │
-   ├──────────────► Descarte
-   │
-   ▼
-Registros válidos
-   │
-   ▼
-Deduplicación exacta
-   │
-   ▼
-Normalización de unidades
-   │
-   ▼
-Flags de negocio
-   │
-   ▼
-Enriquecimiento temporal
-   │
-   ▼
-fact_deliveries
-```
-
-No se aplica el filtro de rango de fechas antes de clasificar las anomalías de fecha.
-
-### Justificación
-
-De esta manera, una fecha nula o inválida no desaparece silenciosamente y puede ser enviada a cuarentena con `_quarantine_reason`.
-
----
-
-## OBS-SLV-002 — La definición de anomalías se centraliza en Silver
-
-### Observación
-
-La arquitectura define seis categorías principales de anomalías:
-
-- `fecha_proceso` nula o inválida;
-- cantidad nula, negativa o cero;
-- material inexistente en catálogo;
-- `tipo_entrega` fuera del conjunto permitido;
-- duplicados exactos;
-- precio nulo.
-
-La arquitectura también define acciones diferentes para cada una: cuarentena, descarte o deduplicación.
-
-### Decisión / mejora aplicada
-
-La implementación clasifica los registros antes de generar `fact_deliveries`.
-
-Las filas enviadas a cuarentena conservan la información disponible y agregan:
-
-```text
-_quarantine_reason
-```
-
-Los tipos de entrega fuera de alcance son contabilizados como descartados y no se incorporan a Silver.
-
-Los duplicados exactos se deduplican conservando una sola copia.
-
-### Beneficio
-
-La lógica permite diferenciar entre:
-
-```text
-ERROR DE DATOS → CUARENTENA
-
-FUERA DE ALCANCE → DESCARTE
-
-DUPLICADO EXACTO → DEDUPLICACIÓN
-```
-
-en lugar de tratar todos los registros inválidos de la misma forma.
-
----
-
-## OBS-SLV-003 — Uso de una clave de negocio compuesta para fact_deliveries
-
-### Observación
-
-La arquitectura define la siguiente clave de negocio para `fact_deliveries`:
-
-```text
-(_tenant_id,
- fecha_proceso,
- transporte,
- ruta,
- material,
- tipo_entrega)
-```
-
-y establece que Silver debe utilizar `MERGE INTO` para actualizar registros existentes o insertar nuevos.
-
-### Decisión / mejora aplicada
-
-La implementación utiliza esta clave como criterio de idempotencia para `fact_deliveries`.
-
-Esto permite que una reejecución del mismo período no genere registros duplicados.
-
-### Trade-off
-
-Una clave compuesta de seis columnas puede resultar más costosa que una clave técnica única, pero mantiene explícita la granularidad de negocio y evita introducir una identidad artificial que no está definida por la fuente.
-
----
-
-## OBS-SLV-004 — Normalización de unidades en Silver
-
-### Observación
-
-La fuente contiene unidades diferentes, mientras que la arquitectura requiere una unidad común:
-
-```text
-1 CS = 20 ST
-```
-
-Todos los registros analíticos de Silver deben quedar expresados en ST.
-
-### Decisión / mejora aplicada
-
-La conversión se realiza mediante operaciones nativas de Spark.
-
-Conceptualmente:
-
-```text
+cantidad = 10
 unidad = CS
-cantidad = X
+```
 
-        ↓
+no tiene el mismo significado que:
 
-cantidad_normalizada_st = X * 20
+```text
+cantidad = 10
 unidad = ST
 ```
 
-Los registros originalmente expresados en ST mantienen su cantidad.
+### Resolución
 
-### Beneficio
+Silver genera explícitamente:
 
-Las capas posteriores pueden realizar agregaciones sin mezclar unidades de medida diferentes.
+```text
+cantidad_normalizada_st
+```
+
+mediante:
+
+```text
+CS → ST
+1 CS = 20 ST
+```
+
+Por ejemplo:
+
+```text
+cantidad = 10
+unidad = CS
+
+cantidad_normalizada_st = 200
+```
+
+Gold consume exclusivamente:
+
+```text
+cantidad_normalizada_st
+```
+
+y no vuelve a realizar la conversión.
+
+### Motivo
+
+La transformación pertenece a Silver porque representa una normalización de datos que debe quedar disponible para todos los consumidores downstream.
+
+Esto evita duplicar la regla de conversión en múltiples tablas Gold.
 
 ---
 
-## OBS-SLV-005 — Flags de negocio derivados de tipo_entrega
+# 4. Uso de `is_current` en SCD Type 2
 
-### Observación
+### Tipo
 
-La arquitectura requiere dos indicadores:
+Ambigüedad arquitectónica resuelta en la implementación.
 
-```text
-is_routine_delivery
-is_bonus_delivery
-```
+### Problema
 
-### Decisión / mejora aplicada
-
-Se implementaron los flags mediante expresiones Spark:
+La dimensión `dim_materials` contiene:
 
 ```text
-ZPRE, ZVE1 → is_routine_delivery = true
-
-Z04, Z05 → is_bonus_delivery = true
-```
-
-Los tipos de entrega fuera del conjunto permitido son tratados previamente como descartados.
-
-### Beneficio
-
-La clasificación queda materializada en Silver y no necesita ser reconstruida por cada consumidor.
-
----
-
-## OBS-SLV-006 — SCD Type 2 para dim_materials
-
-### Observación
-
-La arquitectura establece que `dim_materials` debe utilizar SCD Type 2 con:
-
-```text
-Clave:
-material
-
-Atributos versionados:
-descripcion
-categoria
-precio_base
-
-Control:
 valid_from
 valid_to
 is_current
 ```
 
-y establece que una sola versión debe permanecer como `is_current = true` para cada SKU.
-
-### Decisión / mejora aplicada
-
-La dimensión se implementa manteniendo las versiones históricas del material en lugar de sobrescribir directamente los atributos.
-
-Esto permite conservar el estado histórico del catálogo.
-
-### Trade-off
-
-SCD Type 2 incrementa la cantidad de registros de la dimensión y la complejidad del procesamiento frente a un modelo overwrite, pero permite reconstruir correctamente el estado histórico del catálogo.
-
----
-
-## OBS-SLV-007 — Enriquecimiento mediante join temporal
-
-### Observación
-
-Una ambigüedad importante de la arquitectura podría surgir al utilizar únicamente:
+Una interpretación incorrecta podría consistir en utilizar solamente:
 
 ```text
 is_current = true
 ```
 
-para enriquecer las transacciones.
+para enriquecer todas las entregas.
 
-Esto sería incorrecto para transacciones históricas.
+Esto produciría resultados incorrectos para registros históricos cuando un material haya cambiado de descripción, categoría o precio.
 
-### Decisión / resolución aplicada
+### Resolución
 
-El enriquecimiento utiliza la fecha de la transacción y el período de vigencia de la dimensión:
-
-```text
-fact_deliveries.fecha_proceso
-BETWEEN
-dim_materials.valid_from
-AND
-dim_materials.valid_to
-```
-
-La arquitectura establece explícitamente este comportamiento.
-
-### Justificación
-
-De esta manera, una transacción histórica utiliza el precio y atributos del material correspondientes a la fecha en que ocurrió la operación y no necesariamente los atributos actuales.
-
----
-
-## OBS-SLV-008 — Separación entre precio de transacción y precio del catálogo
-
-### Observación
-
-La dimensión contiene `precio_base`, mientras que las transacciones contienen su propio `precio`.
-
-No deben tratarse como la misma información.
-
-### Decisión / mejora aplicada
-
-Silver conserva ambos conceptos:
+El enriquecimiento de `fact_deliveries` utiliza la fecha de la entrega y la vigencia de la versión:
 
 ```text
-precio
-    → precio asociado a la transacción
-
-precio_base
-    → precio proveniente del catálogo para la versión
-      correspondiente al período
+valid_from <= fecha_proceso <= valid_to
 ```
+
+La columna:
+
+```text
+is_current
+```
+
+se mantiene como indicador informativo, pero no como fuente única de verdad para el join histórico.
+
+Esto corresponde con el requisito explícito de realizar un join temporal y no únicamente un join sobre `is_current`.
 
 ### Beneficio
 
-Esto evita perder el contexto histórico del catálogo y permite diferenciar posteriormente el precio transaccional del precio de referencia.
+Se preserva la consistencia histórica:
+
+```text
+Entrega 2024 → versión del catálogo vigente en 2024
+Entrega 2025 → versión del catálogo vigente en 2025
+```
 
 ---
 
-## OBS-SLV-009 — `_tenant_id` como identificador técnico de tenant
+# 5. Gold como capa derivada y estrategia de idempotencia
 
-### Observación
+### Tipo
 
-La arquitectura utiliza códigos de tenant en minúscula y establece `_tenant_id` como columna técnica.
+Decisión de implementación basada en una consideración de arquitectura.
 
-### Decisión / mejora aplicada
+### Arquitectura propuesta
 
-La implementación mantiene:
+La arquitectura define Gold como una capa derivada y establece el recomputo por partición de fecha como estrategia de idempotencia.
 
-```text
-SV → sv
-HN → hn
-```
+### Decisión
 
-y utiliza:
+Se mantiene Gold como una capa no autoritativa.
 
-```text
-_tenant_id
-```
-
-como identificador técnico consistente entre las capas.
-
-Esto evita depender directamente del valor original de `pais` para identificar el tenant.
-
----
-
-## OBS-SLV-010 — Validaciones automatizadas como contrato de la capa
-
-### Observación
-
-La implementación de Silver fue acompañada por pruebas automatizadas que validan estructura, contenido y reglas de transformación.
-
-Actualmente se cuenta con **24 pruebas automatizadas exitosas**.
-
-### Controles implementados
-
-Entre las validaciones se encuentran:
-
-- estructura Delta;
-- lectura como Delta;
-- existencia de datos;
-- `_tenant_id`;
-- aislamiento de tenant;
-- ausencia de columnas duplicadas;
-- columnas requeridas;
-- tipos de entrega válidos;
-- unidades normalizadas a ST;
-- flags de entrega;
-- consistencia de flags;
-- cantidades válidas;
-- precios válidos;
-- fechas válidas;
-- consistencia tenant/país;
-- enriquecimiento de descripción;
-- enriquecimiento de categoría;
-- enriquecimiento de precio base;
-- existencia de materiales enriquecidos;
-- `_batch_id`;
-- `_ingestion_timestamp`;
-- completitud de la clave de negocio;
-- ausencia de claves de negocio duplicadas.
-
-### Beneficio
-
-La batería de pruebas funciona como una barrera de regresión antes de avanzar con cambios posteriores.
-
----
-
-# 6. Mejoras tecnológicas — Horizonte 2
-
-## OBS-SLV-H2-001 — Separar reglas de negocio de la implementación Python
-
-### Observación
-
-Actualmente las reglas de negocio están expresadas mediante lógica Spark dentro del pipeline.
-
-### Mejora propuesta
-
-Externalizar progresivamente reglas como:
+Para un rango:
 
 ```text
-tipos_entrega_validos
-factor_CS_ST
-columnas_clave
-reglas_de_anomalias
+2025-01-01 → 2025-06-30
 ```
 
-hacia configuración controlada.
+el proceso:
 
-### Beneficio
+1. lee Silver;
+2. filtra el rango;
+3. recalcula las métricas;
+4. sobrescribe el resultado correspondiente.
 
-Permitiría modificar reglas sin alterar directamente el código de procesamiento.
+Esto evita acumular resultados derivados de diferentes ejecuciones.
 
 ### Trade-off
 
-Una mayor parametrización introduce complejidad de configuración y requiere validaciones adicionales sobre los archivos YAML.
+La principal ventaja es la simplicidad y reproducibilidad:
+
+```text
+mismos datos Silver
++
+mismo rango
+=
+mismo resultado Gold
+```
+
+El principal costo es que un reproceso implica recalcular las agregaciones.
+
+Para el volumen de la prueba técnica esta estrategia es adecuada. En un entorno productivo de mayor escala evaluaría estrategias incrementales basadas en particiones o ventanas modificadas.
 
 ---
 
-## OBS-SLV-H2-002 — Implementar un framework formal de Data Quality
+# 6. Manejo de anomalías antes del filtro temporal
 
-### Observación
+### Tipo
 
-Las pruebas automatizadas actuales validan el resultado del pipeline, pero un entorno productivo requiere además persistir los resultados de los controles de calidad como métricas operativas.
+Ambigüedad resuelta en la implementación.
 
-La arquitectura define una tabla compartida `quality_logs` con información como `_run_id`, `_batch_id`, `tenant_id`, `layer`, `check_name`, severidad, registros evaluados y registros fallidos.
+### Problema
 
-### Mejora propuesta
-
-Implementar un componente reutilizable de Data Quality que permita declarar checks como:
+Existe un rango de ejecución:
 
 ```text
-check_name
-check_severity
-condition
-records_checked
-records_failed
+start_date
+end_date
 ```
 
-y persistir automáticamente el resultado.
+y podría parecer razonable filtrar los registros inmediatamente.
+
+Sin embargo, si un registro tiene:
+
+```text
+fecha_proceso = NULL
+```
+
+o una fecha inválida, podría desaparecer antes de llegar al proceso de calidad.
+
+### Resolución
+
+El pipeline Silver realiza:
+
+```text
+Bronze
+  ↓
+Normalización de fecha
+  ↓
+Clasificación de anomalías
+  ↓
+Cuarentena / válidos / descartados
+  ↓
+Filtro de rango
+```
+
+y no:
+
+```text
+Bronze
+  ↓
+Filtro de fechas
+  ↓
+Clasificación
+```
+
+### Motivo
+
+Una fecha inválida constituye una anomalía que debe ser visible y auditable.
+
+La arquitectura establece explícitamente que las fechas nulas o inválidas deben enviarse a cuarentena.
+
+---
+
+# 7. Mejoras Horizonte 2 — Optimización del procesamiento Spark
+
+### Tipo
+
+Mejora tecnológica propuesta.
+
+La implementación actual se ejecuta localmente:
+
+```text
+local[1]
+```
+
+Esto es adecuado para reproducibilidad y para el volumen de la prueba, pero no representa necesariamente la configuración de producción.
+
+En una siguiente iteración propondría evaluar:
+
+- Adaptive Query Execution;
+- broadcast joins cuando corresponda;
+- control de `shuffle partitions`;
+- optimización de archivos pequeños;
+- `OPTIMIZE`;
+- Z-Ordering cuando el patrón de consulta lo justifique;
+- métricas de ejecución Spark;
+- observabilidad de stages y jobs.
 
 ### Beneficio
 
-Permitiría centralizar observabilidad de calidad entre tenants y capas.
+El objetivo sería reducir:
+
+```text
+latencia
++
+shuffle
++
+I/O
++
+costos de computación
+```
+
+sin modificar el contrato lógico de las capas.
 
 ---
 
-## OBS-SLV-H2-003 — Incorporar métricas de procesamiento y anomalías
+# 8. Mejoras Horizonte 2 — Calidad de datos declarativa
 
-### Observación
+La calidad de datos implementada actualmente permite validar las reglas necesarias para la prueba.
 
-Además del resultado final, es útil conocer cuánto volumen fue:
+Como siguiente evolución propondría centralizar los contratos de calidad en una estructura declarativa.
 
-```text
-procesado
-aceptado
-enviado a cuarentena
-descartado
-deduplicado
+Por ejemplo:
+
+```yaml
+silver:
+  checks:
+    - name: valid_quantity
+      severity: critical
+
+    - name: valid_price
+      severity: critical
+
+    - name: valid_delivery_type
+      severity: warning
 ```
 
-### Mejora propuesta
-
-Persistir métricas por ejecución y tenant.
-
-Ejemplo:
+Esto permitiría desacoplar:
 
 ```text
-tenant_id
+regla
++
+severidad
++
+comportamiento
+```
+
+del código Python.
+
+También facilitaría agregar nuevos checks sin modificar significativamente el pipeline.
+
+---
+
+# 9. Mejoras Horizonte 2 — Observabilidad operacional
+
+La siguiente iteración debería ampliar la observabilidad del pipeline.
+
+Además de los `quality_logs`, propondría registrar métricas como:
+
+```text
+tenant
 batch_id
-source_records
-valid_records
-quarantine_records
+layer
+start_date
+end_date
+input_records
+output_records
+quarantined_records
 discarded_records
-deduplicated_records
-processed_at
+execution_time
+status
 ```
 
-### Beneficio
+Esto permitiría construir una visión operacional:
 
-Facilita monitoreo operacional y detección de cambios anómalos en el volumen de datos.
+```text
+             PIPELINE RUN
+                  │
+       ┌──────────┼──────────┐
+       ▼          ▼          ▼
+     Bronze     Silver      Gold
+       │          │          │
+       ▼          ▼          ▼
+    records    records    metrics
+       │          │          │
+       └──────────┼──────────┘
+                  ▼
+             observability
+```
+
+Esto sería especialmente relevante al aumentar el número de tenants.
 
 ---
 
-# 7. Mejoras tecnológicas — Horizonte 3
+# 10. Mejoras Horizonte 3 — Procesamiento incremental
 
-## OBS-PLT-H3-001 — Migración del almacenamiento local hacia ADLS Gen2 + Unity Catalog
+La implementación actual favorece el recomputo, lo cual simplifica la idempotencia.
 
-### Observación
-
-La prueba técnica utiliza paths locales para reproducir la arquitectura, mientras que el diseño objetivo está basado en Databricks, ADLS Gen2 y Unity Catalog.
-
-La arquitectura define schemas separados por tenant dentro de un catálogo por ambiente.
-
-### Mejora propuesta
-
-Migrar:
+A medida que aumente el volumen, propondría evolucionar hacia procesamiento incremental:
 
 ```text
-data/bronze/
-data/silver/
-data/shared/
+Nuevos archivos
+      │
+      ▼
+Detectar cambios
+      │
+      ▼
+Procesar únicamente
+particiones afectadas
+      │
+      ▼
+Actualizar Silver
+      │
+      ▼
+Actualizar Gold
 ```
 
-hacia almacenamiento cloud administrado.
+Para ello podrían evaluarse mecanismos como:
 
-La estructura lógica de nombres se mantendría:
+- Delta Change Data Feed;
+- Auto Loader;
+- Structured Streaming;
+- estrategias de watermarking;
+- procesamiento incremental por partición.
+
+Esto reduciría el costo de recalcular grandes ventanas históricas.
+
+---
+
+# 11. Mejoras Horizonte 3 — Migración a Databricks + Unity Catalog
+
+La arquitectura final prevista está orientada a:
 
 ```text
-saas_<env>.silver_<tenant>.fact_deliveries
-saas_<env>.silver_<tenant>.dim_materials
+Databricks
++
+ADLS Gen2
++
+Unity Catalog
 ```
 
-### Beneficio
+La implementación local representa estos componentes mediante:
 
-Se obtendrían:
+```text
+Spark local
++
+filesystem
++
+paths por tenant
+```
+
+En una evolución productiva propondría migrar los paths hacia tablas gobernadas por Unity Catalog:
+
+```text
+saas_dev.bronze_sv.deliveries
+saas_dev.silver_sv.fact_deliveries
+saas_dev.silver_sv.dim_materials
+saas_dev.gold_sv.daily_metrics_by_delivery_type
+```
+
+Esto permitiría incorporar:
 
 - gobierno centralizado;
-- control de acceso;
+- permisos;
+- lineage;
 - auditoría;
-- escalabilidad;
-- integración con workloads analíticos.
+- políticas de acceso;
+- descubrimiento de datos;
+- gestión de esquemas.
+
+La arquitectura provista ya contempla este mapeo conceptual.
 
 ---
 
-## OBS-PLT-H3-002 — Incorporar procesamiento incremental y observabilidad productiva
+# 12. Resumen de observaciones
 
-### Mejora propuesta
-
-En un entorno productivo, el procesamiento podría evolucionar desde ejecución batch local hacia mecanismos incrementales y orquestados.
-
-La arquitectura contempla como evolución posible el uso de tecnologías como Auto Loader/streaming. Esta mejora debe evaluarse según volumen, frecuencia de llegada y SLA.
-
-### Beneficio
-
-Reduciría procesamiento innecesario y permitiría responder más rápidamente ante nuevas entregas de datos.
-
-### Trade-off
-
-Incrementaría significativamente la complejidad operacional frente al procesamiento batch actual.
+| # | Ángulo | Observación | Resolución / propuesta |
+|---|---|---|---|
+| 1 | Arquitectura | Schema por tenant puede incrementar complejidad a gran escala | Evaluar esquema común + aislamiento mediante políticas |
+| 2 | Ambigüedad | Diferencia entre precio transaccional y precio de catálogo | Crear `precio_transaccion` explícito |
+| 3 | Ambigüedad | Gold requiere cantidad normalizada | Crear `cantidad_normalizada_st` en Silver |
+| 4 | Ambigüedad | Riesgo de usar solo `is_current` en SCD | Join temporal por vigencia |
+| 5 | Arquitectura | Gold es derivada | Recomputación para garantizar idempotencia |
+| 6 | Ambigüedad | Fechas inválidas podrían perderse por filtro | Clasificar anomalías antes del filtro |
+| 7 | Horizonte 2 | Optimización Spark | AQE, shuffle, archivos pequeños, OPTIMIZE |
+| 8 | Horizonte 2 | Calidad declarativa | Checks parametrizados mediante YAML |
+| 9 | Horizonte 2 | Observabilidad | Métricas operacionales por ejecución |
+| 10 | Horizonte 3 | Procesamiento incremental | CDF / Auto Loader / Streaming |
+| 11 | Horizonte 3 | Infraestructura productiva | Databricks + ADLS + Unity Catalog |
 
 ---
 
-# 8. Resumen de decisiones
+# 13. Conclusión
 
-| Área | Decisión |
-|---|---|
-| RAW | Mantener archivos originales sin transformación |
-| Bronze | Preservar columnas RAW |
-| Bronze | Agregar únicamente metadatos técnicos |
-| Bronze | Particionar por fecha y tenant |
-| Bronze | `overwrite + replaceWhere` para idempotencia |
-| Silver | Clasificar anomalías antes de aplicar filtros que puedan ocultarlas |
-| Silver | Cuarentena para errores de datos |
-| Silver | Descarte para tipos de entrega fuera de alcance |
-| Silver | Deduplicación exacta |
-| Silver | Normalización CS → ST |
-| Silver | Flags derivados de `tipo_entrega` |
-| Silver | `fact_deliveries` con clave de negocio compuesta |
-| Silver | `dim_materials` como SCD Type 2 |
-| Silver | Join temporal para enriquecimiento |
-| Silver | `_tenant_id` como identificador técnico |
-| Silver | 24 pruebas automatizadas exitosas |
-| Futuro | Data Quality operacional |
-| Futuro | ADLS Gen2 + Unity Catalog |
-| Futuro | Procesamiento incremental |
+La arquitectura proporcionada permite construir un MVP sólido para una plataforma de datos multi-tenant. La implementación mantiene la separación de responsabilidades entre las capas:
+
+```text
+RAW
+  ↓
+preservación
+
+BRONZE
+  ↓
+ingesta + trazabilidad + idempotencia
+
+SILVER
+  ↓
+calidad + normalización + SCD + enriquecimiento
+
+GOLD
+  ↓
+métricas de negocio
+```
+
+Las principales decisiones adicionales se enfocaron en hacer explícitas las semánticas necesarias para evitar errores downstream, particularmente:
+
+```text
+cantidad_normalizada_st
+precio_transaccion
+```
+
+y en resolver correctamente el enriquecimiento temporal de la dimensión SCD Type 2.
+
+Para una siguiente etapa productiva, las prioridades serían observabilidad, procesamiento incremental, optimización de Spark y migración de los paths locales hacia ADLS Gen2 y Unity Catalog.

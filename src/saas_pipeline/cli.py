@@ -3,6 +3,7 @@ import argparse
 from saas_pipeline.bronze import run_bronze
 from saas_pipeline.config import load_config
 from saas_pipeline.silver import run_silver
+from saas_pipeline.gold import run_gold
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -12,7 +13,7 @@ def parse_arguments() -> argparse.Namespace:
 
     parser.add_argument(
         "--layer",
-        choices=["bronze", "silver"],
+        choices=["bronze", "silver","gold"],
         required=True,
         help="Pipeline layer to execute.",
     )
@@ -61,6 +62,9 @@ def main() -> None:
 
     elif args.layer == "silver":
         run_silver(config)
+
+    elif args.layer == "gold":
+        run_gold(config)
 
 
 if __name__ == "__main__":
