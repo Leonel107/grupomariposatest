@@ -13,4 +13,5 @@ execution:
   fail_fast: false
 
 quality:
-  fail_on_critical: false
+  fail_on_critical: true
+  logs_path: data/shared/quality_logs

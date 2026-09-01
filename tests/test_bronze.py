@@ -11,15 +11,13 @@ from pyspark.sql.functions import (
     sha2,
 )
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
 from pyspark.sql.types import (
     StringType,
     IntegerType,
     DoubleType,
 )
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 EXPECTED_RAW_SCHEMA = {
     "pais": StringType,

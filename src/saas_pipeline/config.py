@@ -18,8 +18,19 @@ def load_config(
         2. env/<environment>.yaml
         3. tenants/<tenant>.yaml
     """
-    base_path = PROJECT_ROOT / "config" / "base.yaml"
-    env_path = PROJECT_ROOT / "config" / "env" / f"{environment}.yaml"
+
+    base_path = (
+        PROJECT_ROOT
+        / "config"
+        / "base.yaml"
+    )
+
+    env_path = (
+        PROJECT_ROOT
+        / "config"
+        / "env"
+        / f"{environment}.yaml"
+    )
 
     if not base_path.exists():
         raise FileNotFoundError(
@@ -46,13 +57,30 @@ def load_config(
 
         if not tenant_path.exists():
             raise FileNotFoundError(
-                f"Tenant configuration not found: {tenant_path}"
+                f"Tenant configuration not found: "
+                f"{tenant_path}"
             )
 
-        configs.append(OmegaConf.load(tenant_path))
+        configs.append(
+            OmegaConf.load(tenant_path)
+        )
 
     config = OmegaConf.merge(*configs)
 
     config.execution.tenant = tenant.lower()
+
+    # Validate mandatory quality configuration.
+    if not hasattr(config, "quality"):
+        raise ValueError(
+            "Missing 'quality' configuration."
+        )
+
+    if not hasattr(
+        config.quality,
+        "fail_on_critical",
+    ):
+        raise ValueError(
+            "Missing 'quality.fail_on_critical'."
+        )
 
     return config
