@@ -1,8 +1,8 @@
 import pandas as pd
 from pyspark.sql import SparkSession
- 
+
 spark = SparkSession.builder.getOrCreate()
- 
+
 def process(file_path, country):
     df = pd.read_csv(file_path)
     df = df[df["pais"] == country]
@@ -25,5 +25,5 @@ def process(file_path, country):
     sdf.write.mode("overwrite").parquet("/tmp/output/" + country)
     print("done")
     return out
- 
+
 process("data.csv", "GT")
