@@ -16,7 +16,10 @@ def load_config(
     Configuration precedence:
         1. base.yaml
         2. env/<environment>.yaml
-        3. tenants/<tenant>.yaml
+        3. tenants/<tenant>.yaml when a specific tenant is requested
+
+    When tenant == "all", all tenant configuration files are discovered
+    from config/tenants/.
     """
 
     base_path = (
@@ -32,6 +35,12 @@ def load_config(
         / f"{environment}.yaml"
     )
 
+    tenants_path = (
+        PROJECT_ROOT
+        / "config"
+        / "tenants"
+    )
+
     if not base_path.exists():
         raise FileNotFoundError(
             f"Base configuration not found: {base_path}"
@@ -42,17 +51,74 @@ def load_config(
             f"Environment configuration not found: {env_path}"
         )
 
+    if not tenants_path.exists():
+        raise FileNotFoundError(
+            f"Tenant configuration directory not found: {tenants_path}"
+        )
+
     configs = [
         OmegaConf.load(base_path),
         OmegaConf.load(env_path),
     ]
 
-    if tenant != "all":
+    tenant = tenant.lower()
+
+    # ---------------------------------------------------------
+    # Tenant configuration
+    # ---------------------------------------------------------
+
+    if tenant == "all":
+        tenant_files = sorted(
+            tenants_path.glob("*.yaml")
+        )
+
+        if not tenant_files:
+            raise FileNotFoundError(
+                f"No tenant configuration files found in: "
+                f"{tenants_path}"
+            )
+
+        tenant_ids = []
+
+        for tenant_file in tenant_files:
+            tenant_config = OmegaConf.load(
+                tenant_file
+            )
+
+            if not hasattr(
+                tenant_config,
+                "tenant",
+            ):
+                raise ValueError(
+                    f"Missing 'tenant' section in: "
+                    f"{tenant_file}"
+                )
+
+            if not hasattr(
+                tenant_config.tenant,
+                "id",
+            ):
+                raise ValueError(
+                    f"Missing 'tenant.id' in: "
+                    f"{tenant_file}"
+                )
+
+            tenant_id = str(
+                tenant_config.tenant.id
+            ).lower()
+
+            tenant_ids.append(tenant_id)
+
+        # Expose the available tenants to the rest
+        # of the pipeline.
+        config = OmegaConf.merge(*configs)
+
+        config.tenants = tenant_ids
+
+    else:
         tenant_path = (
-            PROJECT_ROOT
-            / "config"
-            / "tenants"
-            / f"{tenant.lower()}.yaml"
+            tenants_path
+            / f"{tenant}.yaml"
         )
 
         if not tenant_path.exists():
@@ -61,16 +127,51 @@ def load_config(
                 f"{tenant_path}"
             )
 
-        configs.append(
-            OmegaConf.load(tenant_path)
+        tenant_config = OmegaConf.load(
+            tenant_path
         )
 
-    config = OmegaConf.merge(*configs)
+        if not hasattr(
+            tenant_config,
+            "tenant",
+        ):
+            raise ValueError(
+                f"Missing 'tenant' configuration "
+                f"in: {tenant_path}"
+            )
 
-    config.execution.tenant = tenant.lower()
+        if not hasattr(
+            tenant_config.tenant,
+            "id",
+        ):
+            raise ValueError(
+                f"Missing 'tenant.id' in: "
+                f"{tenant_path}"
+            )
 
-    # Validate mandatory quality configuration.
-    if not hasattr(config, "quality"):
+        configs.append(
+            tenant_config
+        )
+
+        config = OmegaConf.merge(*configs)
+
+        # Keep a uniform configuration contract.
+        config.tenants = [tenant]
+
+    # ---------------------------------------------------------
+    # Execution configuration
+    # ---------------------------------------------------------
+
+    config.execution.tenant = tenant
+
+    # ---------------------------------------------------------
+    # Quality configuration validation
+    # ---------------------------------------------------------
+
+    if not hasattr(
+        config,
+        "quality",
+    ):
         raise ValueError(
             "Missing 'quality' configuration."
         )
