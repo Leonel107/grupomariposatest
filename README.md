@@ -24,15 +24,14 @@ La plataforma sigue una arquitectura Medallion con separación lógica por tenan
                                     ▼
                          ┌──────────────────────┐
                          │         RAW          │
-                         │                      │
                          │ Archivo original     │
                          │ Sin transformación   │
                          └──────────┬───────────┘
                                     │
+                                    │ overwrite por partición
                                     ▼
                          ┌──────────────────────┐
                          │       BRONZE         │
-                         │                      │
                          │ Delta Lake           │
                          │ Esquema original     │
                          │ + columnas técnicas  │
@@ -40,28 +39,38 @@ La plataforma sigue una arquitectura Medallion con separación lógica por tenan
                          │ Idempotencia         │
                          └──────────┬───────────┘
                                     │
+                                    │ MERGE INTO
                                     ▼
-                         ┌──────────────────────┐
-                         │        SILVER        │
-                         │                      │
-                         │ fact_deliveries      │
-                         │ Normalización         │
-                         │ Anomalías             │
-                         │ SCD Type 2             │
-                         │ Enriquecimiento       │
-                         │ Calidad               │
-                         └──────────┬───────────┘
-                                    │
-                                    ▼
-                         ┌──────────────────────┐
-                         │         GOLD         │
-                         │                      │
-                         │ daily_metrics_       │
-                         │ by_delivery_type     │
-                         │                      │
-                         │ Métricas de negocio  │
-                         └──────────────────────┘
+             ┌──────────────────────┴──────────────────────┐
+             │                    SILVER                   │
+             │                                             │
+             │ fact_deliveries                              │
+             │ Normalización · anomalías · deduplicación   │
+             │ SCD Type 2 · enriquecimiento temporal       │
+             └──────────────┬──────────────────────────────┘
+                            │
+              ┌─────────────┴─────────────┐
+              │                           │
+              ▼                           ▼
+   ┌──────────────────────┐    ┌──────────────────────────┐
+   │ SILVER QUARANTINE   │    │      SHARED              │
+   │                      │    │                          │
+   │ Registros inválidos  │    │ quality_logs             │
+   │ _quarantine_reason   │    │ Validaciones DQ           │
+   └──────────────────────┘    └──────────────────────────┘
+              │
+              │ solo registros válidos
+              └──────────────┬─────────────
+                             ▼
+                  ┌──────────────────────┐
+                  │         GOLD         │
+                  │ daily_metrics_       │
+                  │ by_delivery_type     │
+                  │ Métricas de negocio  │
+                  └──────────────────────┘
 ```
+
+`quality_logs` y la cuarentena son flujos transversales asociados al procesamiento de Silver. Los registros enviados a cuarentena no continúan hacia Gold. Si `quality.fail_on_critical = true` y una validación crítica falla, el quality gate aborta la ejecución antes de Gold.
 
 La arquitectura provista establece que cada capa lea únicamente de la capa inmediatamente anterior y que Silver sea la zona de verdad para el consumo analítico downstream.
 
@@ -82,6 +91,8 @@ La solución cubre los siguientes objetivos:
 - Normalización de unidades.
 - Validación y clasificación de anomalías.
 - Cuarentena de registros inválidos.
+- Persistencia de resultados de calidad en `shared/quality_logs/`.
+- Quality gate previo a Gold para validaciones críticas.
 - Deduplicación de registros exactos.
 - Dimensión `dim_materials` con SCD Type 2.
 - Enriquecimiento temporal de entregas con información del catálogo.
@@ -175,10 +186,10 @@ saas-data-platform/
 │
 ├── tests/
 │   ├── conftest.py
-│   ├── test_spark_environment.py
 │   ├── test_bronze.py
 │   ├── test_silver.py
-│   └── test_gold.py
+│   ├── test_gold.py
+│   └── test_quality.py
 │
 └── mentoring/
     ├── bad_code.py
@@ -431,6 +442,40 @@ No se utiliza únicamente `is_current`, ya que una entrega histórica debe asoci
 
 La arquitectura exige explícitamente un join temporal con la dimensión SCD Type 2.
 
+## 7.2 Calidad de datos y Quality Gate
+
+La calidad se ejecuta sobre Silver antes de construir Gold. Las validaciones generan resultados con severidad `critical`, `warning` o `info` y se persisten en:
+
+```text
+data/shared/quality_logs/
+```
+
+El contrato lógico de `quality_logs` incluye:
+
+```text
+_run_id
+_batch_id
+tenant_id
+layer
+table_name
+check_name
+check_severity
+records_checked
+records_failed
+check_passed
+executed_at
+```
+
+Las anomalías de datos se manejan mediante una zona de cuarentena separada:
+
+```text
+data/silver_quarantine/<tenant>/fact_deliveries/
+```
+
+Los registros enviados a cuarentena permanecen fuera de `fact_deliveries` y conservan `_quarantine_reason`. Los descartes por reglas de negocio se contabilizan durante el procesamiento.
+
+El quality gate consulta los resultados de las validaciones. Cuando `quality.fail_on_critical` está configurado en `true`, cualquier validación crítica fallida provoca un `RuntimeError` y detiene el procesamiento antes de Gold. Cuando las validaciones críticas pasan, el pipeline puede continuar hacia la capa Gold.
+
 ---
 
 # 8. Capa Gold
@@ -674,15 +719,28 @@ pip install -e .
 
 ---
 
-# 14. Verificar Spark + Delta
+# 14. Validación del entorno
 
-Ejecutar:
+El repositorio no contiene un archivo `test_spark_environment.py` independiente. La compatibilidad del entorno Spark + Delta se valida mediante la instalación de las versiones fijadas en `pyproject.toml` y mediante la ejecución de las pruebas de las capas Bronze, Silver, Gold y Quality.
+
+Antes de ejecutar el pipeline se puede comprobar:
 
 ```powershell
-pytest tests/test_spark_environment.py -v
+python --version
+java -version
 ```
 
-La prueba debe finalizar correctamente.
+Y validar que las dependencias del proyecto estén instaladas:
+
+```powershell
+python -m pip install -e ".[dev]"
+```
+
+La validación automatizada completa se realiza con:
+
+```powershell
+pytest -v
+```
 
 ---
 
@@ -732,10 +790,10 @@ Las pruebas se encuentran en:
 ```text
 tests/
 ├── conftest.py
-├── test_spark_environment.py
 ├── test_bronze.py
 ├── test_silver.py
-└── test_gold.py
+├── test_gold.py
+└── test_quality.py
 ```
 
 ## Todos los tests
@@ -762,11 +820,20 @@ pytest tests/test_silver.py -v
 pytest tests/test_gold.py -v
 ```
 
-## Entorno Spark + Delta
+## Quality
 
 ```powershell
-pytest tests/test_spark_environment.py -v
+pytest tests/test_quality.py -v
 ```
+
+Las pruebas de Quality validan, entre otros aspectos:
+
+- columnas requeridas;
+- severidad de las validaciones;
+- conteo de registros revisados y fallidos;
+- manejo de claves de negocio nulas;
+- validaciones de unidades normalizadas;
+- contrato del esquema de `quality_logs`.
 
 Las pruebas de Silver cubren, entre otros aspectos:
 
@@ -853,16 +920,25 @@ pull_request
 y validar como mínimo:
 
 ```text
-Linter
+Checkout
    │
    ▼
-Tests
+Python 3.13.2 + Java 17
    │
    ▼
-Resultado CI
+Instalación del proyecto + dependencias dev
+   │
+   ├──────────────► Ruff check .
+   │
+   ├──────────────► pytest tests -v
+   │
+   └──────────────► Validación de YAML con OmegaConf
+                         │
+                         ▼
+                    Resultado CI
 ```
 
-Esto permite evitar que cambios que rompan el pipeline o sus pruebas lleguen a la rama principal.
+El workflow se ejecuta en cada `push` y `pull_request`. Además del linter y las pruebas automatizadas, valida que los archivos YAML bajo `config/` puedan cargarse correctamente mediante OmegaConf. Esto permite detectar problemas de calidad de código, regresiones y configuraciones inválidas antes de integrar cambios.
 
 ---
 
@@ -1120,6 +1196,7 @@ La prueba está orientada principalmente a demostrar la correcta implementación
 | Tests Bronze | Implementados |
 | Tests Silver | Implementados |
 | Tests Gold | Implementados |
+| Tests Quality | Implementados |
 | CI/CD | Implementado según configuración del repositorio |
 | Infraestructura cloud | Fuera del alcance |
 | Unity Catalog funcional | Fuera del alcance |
